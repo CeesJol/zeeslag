@@ -122,6 +122,7 @@ function startGame() {
   $('#home').hidden = true;
   $('#game').hidden = false;
   $('#score').hidden = false;
+  $('#love').hidden = false;
   $('#net').hidden = false;
   $('#invite-link').value = inviteLink();
   if (state.role === 'host') openHost(); else openGuest();
@@ -339,6 +340,10 @@ function onMessage(msg) {
     case 'result': onResult(msg); break;
     case 'reveal':
       if (msg.round === state.round && Array.isArray(msg.ships)) state.oppReveal = msg.ships;
+      break;
+    case 'love':
+      toast('♥ Ik hou van jou', 'love');
+      floatHearts(9);
       break;
     case 'rematch':
       if (msg.round !== state.round || state.phase !== 'over') return;
@@ -715,6 +720,7 @@ function bindControls() {
   $('#clear').addEventListener('click', armClear);
   $('#ready').addEventListener('click', markReady);
   $('#rematch').addEventListener('click', requestRematch);
+  $('#love').addEventListener('click', sendLove);
   $('#copy').addEventListener('click', async () => {
     const input = $('#invite-link');
     try {
@@ -800,6 +806,7 @@ function render() {
 
   $('#score').innerHTML = `Jij <b>${state.score.me}</b> – <b>${state.score.opp}</b> Tegenstander`;
   $('#net').className = connected ? 'ok' : blocked ? 'blocked' : 'wait';
+  $('#love').disabled = !connected || loveCooling;
   $('#net-text').textContent = connected ? 'Verbonden' : netProblem ?? 'Wachten op je tegenstander…';
 
   $('#invite').hidden = !(state.role === 'host' && !connected && !blocked);
@@ -929,6 +936,31 @@ function renderPlacement() {
 }
 
 let toastTimer = null;
+let loveCooling = false;
+function sendLove() {
+  if (!isConnected() || loveCooling) return;
+  post({ type: 'love' });
+  save();
+  toast('Verstuurd ♥', 'love');
+  floatHearts(3);
+  loveCooling = true;
+  render();
+  setTimeout(() => { loveCooling = false; render(); }, 2000);
+}
+
+function floatHearts(count) {
+  for (let i = 0; i < count; i++) {
+    const heart = document.createElement('span');
+    heart.className = 'heart';
+    heart.textContent = '♥';
+    heart.style.left = `${10 + Math.random() * 80}vw`;
+    heart.style.animationDelay = `${i * 0.15}s`;
+    heart.style.fontSize = `${16 + Math.random() * 18}px`;
+    heart.addEventListener('animationend', () => heart.remove());
+    document.body.append(heart);
+  }
+}
+
 function toast(text, tone = '') {
   const el = $('#toast');
   el.textContent = text;
