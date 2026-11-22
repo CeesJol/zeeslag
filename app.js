@@ -509,7 +509,7 @@ function rotate(x = pointer?.[0], y = pointer?.[1]) {
   const placed = rc && !drag?.moved && shipAtCell(...rc);
   if (placed) return rotatePlaced(placed, rc);
   if (!placing.selected) {
-    toast('Wijs met de muis een schip aan en druk dan op D.');
+    toast('Wijs met de muis een schip aan en druk dan op de spatiebalk.');
     return;
   }
   placing.horizontal = !placing.horizontal;
@@ -733,12 +733,16 @@ function bindControls() {
       rotate(e.clientX, e.clientY);
     }
   });
+  // Space would also scroll the page or press the focused button (on keyup),
+  // so both events are blocked while ships are placed.
+  const isRotateKey = (e) => e.code === 'Space' && !e.metaKey && !e.ctrlKey && !e.altKey && canEditFleet();
   document.addEventListener('keydown', (e) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
-    if (e.key === 'd' || e.key === 'D' || e.code === 'KeyD') {
-      e.preventDefault();
-      rotate();
-    }
+    if (!isRotateKey(e)) return;
+    e.preventDefault();
+    if (!e.repeat) rotate();
+  });
+  document.addEventListener('keyup', (e) => {
+    if (isRotateKey(e)) e.preventDefault();
   });
 }
 
