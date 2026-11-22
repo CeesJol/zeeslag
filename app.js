@@ -8,6 +8,7 @@ const HEARTBEAT_MS = 3000;
 const TIMEOUT_MS = 12000;
 const DIAL_RETRY_MS = 4000;
 const DRAG_THRESHOLD_PX = 5;
+const DROP_MARGIN_PX = 30;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -25,7 +26,7 @@ let wasLinked = false;
 const placing = { selected: null, horizontal: true, hover: null, offset: 0 };
 let drag = null;
 let pointer = null;
-let suppressClick = false;
+let swallowClick = false;
 let clearArmed = false;
 let clearTimer = null;
 
@@ -509,8 +510,7 @@ function clickCell(r, c) {
 // in hand, a placed ship under the pointer turns in place.
 function rotate(x = pointer?.[0], y = pointer?.[1]) {
   if (!canEditFleet()) return;
-  const cell = x == null ? null : boardCellAt(x, y);
-  const rc = cell && [Number(cell.dataset.r), Number(cell.dataset.c)];
+  const rc = x == null ? null : myCellAt(x, y);
   const placed = rc && !drag?.moved && shipAtCell(...rc);
   if (placed) return rotatePlaced(placed, rc);
   if (!placing.selected) {
@@ -572,25 +572,35 @@ function moveDrag(e) {
     if (drag.origin) pickUp(drag.origin, drag.offset);
     else selectShip(drag.id);
     document.body.classList.add('dragging');
+    // A focused button would still react to Enter or Space during the drag.
+    document.activeElement?.blur?.();
     updateGhost();
     render();
   }
-  const cell = boardCellAt(e.clientX, e.clientY);
-  placing.hover = cell ? [Number(cell.dataset.r), Number(cell.dataset.c)] : null;
+  trackDrag(e.clientX, e.clientY);
+}
+
+function trackDrag(x, y) {
+  placing.hover = myCellAt(x, y, DROP_MARGIN_PX);
   const ghost = $('#ghost');
   ghost.hidden = Boolean(placing.hover);
-  ghost.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
+  ghost.style.transform = `translate(${x + 12}px, ${y + 12}px)`;
   renderMyBoard();
 }
 
-// The 2 px gap between cells is part of the board, not of a cell. A drop
-// there must still land on the nearest cell, so look 2 px around the point.
-function boardCellAt(x, y) {
-  for (const [dx, dy] of [[0, 0], [-2, 0], [2, 0], [0, -2], [0, 2], [-2, -2], [2, 2], [-2, 2], [2, -2]]) {
-    const cell = document.elementFromPoint(x + dx, y + dy)?.closest?.('#my-board .cell');
-    if (cell) return cell;
-  }
-  return null;
+// Maps a point to a cell of my board by geometry, not by the element under
+// the point: the 2 px gaps between cells belong to the board element, and a
+// press or drop there must still count for the nearest cell. With a margin,
+// a point on the labels or just outside the cells maps to the nearest cell.
+function myCellAt(x, y, margin = 0) {
+  const cells = $('#my-board').querySelectorAll('.cell');
+  const first = cells[0].getBoundingClientRect();
+  const last = cells[cells.length - 1].getBoundingClientRect();
+  if (x < first.left - margin || x > last.right + margin || y < first.top - margin || y > last.bottom + margin) return null;
+  const pitchX = (last.left - first.left) / (SIZE - 1);
+  const pitchY = (last.top - first.top) / (SIZE - 1);
+  const index = (v, start, pitch, size) => Math.min(SIZE - 1, Math.max(0, Math.floor((v - start + (pitch - size) / 2) / pitch)));
+  return [index(y, first.top, pitchY, first.height), index(x, first.left, pitchX, first.width)];
 }
 
 function endDrag(cancel = false) {
@@ -598,8 +608,7 @@ function endDrag(cancel = false) {
   const { moved, origin } = drag;
   drag = null;
   if (!moved) return;
-  suppressClick = true;
-  setTimeout(() => { suppressClick = false; }, 0);
+  swallowClick = true;
   document.body.classList.remove('dragging');
   $('#ghost').hidden = true;
   const overBoard = Boolean(placing.hover);
@@ -607,7 +616,7 @@ function endDrag(cancel = false) {
   if (!dropped && overBoard && !cancel) {
     toast('Daar past het schip niet. Schepen mogen elkaar niet raken, ook niet schuin.', 'bad');
   }
-  if (!dropped && origin) {
+  if (!dropped && origin && !state.myShips.some((s) => s.id === origin.id)) {
     state.myShips.push(origin);
     selectShip(nextUnplaced());
   }
@@ -659,14 +668,14 @@ function buildBoard(el, side) {
     return cell && [Number(cell.dataset.r), Number(cell.dataset.c)];
   };
   el.addEventListener('click', (e) => {
-    const rc = cellOf(e);
-    if (!rc || suppressClick) return;
+    const rc = side === 'my' ? myCellAt(e.clientX, e.clientY) : cellOf(e);
+    if (!rc) return;
     if (side === 'opp') fire(...rc);
     else if (canEditFleet()) clickCell(...rc);
   });
   if (side !== 'my') return;
   el.addEventListener('pointerdown', (e) => {
-    const rc = cellOf(e);
+    const rc = myCellAt(e.clientX, e.clientY);
     const ship = rc && canEditFleet() && shipAtCell(...rc);
     if (!ship || e.button !== 0) return;
     e.preventDefault();
@@ -726,14 +735,37 @@ function bindControls() {
   });
   $('#picker').addEventListener('click', (e) => {
     const item = e.target.closest('[data-ship]');
-    if (!item || !canEditFleet() || suppressClick) return;
+    if (!item || !canEditFleet()) return;
     if (state.myShips.some((s) => s.id === item.dataset.ship)) toast(MOVE_HINT);
     else selectShip(item.dataset.ship);
     save();
     render();
   });
+  // Capture phase, before any other handler. If a pointerup was lost, the
+  // ship still hangs on the pointer and this press drops it.
+  document.addEventListener('pointerdown', (e) => {
+    swallowClick = false;
+    if (!drag?.moved) return;
+    trackDrag(e.clientX, e.clientY);
+    endDrag();
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, true);
+  // The click that follows a drag must not also place or select a ship.
+  document.addEventListener('click', (e) => {
+    if (!swallowClick) return;
+    swallowClick = false;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, true);
   document.addEventListener('pointermove', moveDrag);
-  document.addEventListener('pointerup', () => endDrag());
+  document.addEventListener('pointerup', (e) => {
+    if (drag?.moved) trackDrag(e.clientX, e.clientY);
+    endDrag();
+  });
+  window.addEventListener('scroll', () => {
+    if (drag?.moved && pointer) trackDrag(...pointer);
+  });
   document.addEventListener('pointercancel', () => endDrag(true));
   window.addEventListener('blur', () => endDrag(true));
   document.addEventListener('contextmenu', (e) => {
