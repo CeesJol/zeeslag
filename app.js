@@ -463,8 +463,10 @@ function previewCells() {
   if (!placing.selected || !placing.hover) return null;
   const def = FLEET.find((d) => d.id === placing.selected);
   const [hr, hc] = placing.hover;
-  const r = placing.horizontal ? hr : hr - placing.offset;
-  const c = placing.horizontal ? hc - placing.offset : hc;
+  // Near an edge the ship slides back onto the board instead of sticking out.
+  const fit = (v) => Math.min(Math.max(v, 0), SIZE - def.length);
+  const r = placing.horizontal ? hr : fit(hr - placing.offset);
+  const c = placing.horizontal ? fit(hc - placing.offset) : hc;
   const cells = shipCells(r, c, def.length, placing.horizontal);
   return { cells, ok: canPlace(state.myShips, cells) };
 }
@@ -489,9 +491,12 @@ function dropSelected() {
   return true;
 }
 
+const MOVE_HINT = 'Sleep het schip om het te verplaatsen. Draaien: spatiebalk of rechtermuisknop.';
+
+// A placed ship only moves by dragging. A plain click that picked it up made
+// the ship jump to the pointer when a short drag was read as a click.
 function clickCell(r, c) {
-  const owner = shipAtCell(r, c);
-  if (owner) pickUp(owner, owner.cells.findIndex(([sr, sc]) => sr === r && sc === c));
+  if (shipAtCell(r, c)) toast(MOVE_HINT);
   else if (placing.selected) {
     placing.hover = [r, c];
     dropSelected();
@@ -543,15 +548,16 @@ function rotatePlaced(ship, [r, c]) {
 
 function startDrag(e, id, origin, offset) {
   if (e.button !== 0 || !canEditFleet()) return;
+  if (drag) endDrag();
   drag = { id, origin, offset, x: e.clientX, y: e.clientY, moved: false };
 }
 
 function moveDrag(e) {
   pointer = [e.clientX, e.clientY];
   if (!drag) return;
-  // Left button up while the right one is still down is a normal drop; no
-  // button down at all means the release happened outside the window.
-  if (!(e.buttons & 1)) return endDrag(!(e.buttons & 2));
+  // pointerup only comes when the last button is released, so a release of
+  // the left button while the right one is still held is the drop.
+  if (drag.moved && e.buttons === 2) return endDrag();
   // A right-button press during a drag shows up as a pointermove in Chrome;
   // some browsers send contextmenu instead, so remember when it was handled.
   const right = Boolean(e.buttons & 2);
@@ -567,13 +573,14 @@ function moveDrag(e) {
     else selectShip(drag.id);
     document.body.classList.add('dragging');
     updateGhost();
+    render();
   }
   const cell = boardCellAt(e.clientX, e.clientY);
   placing.hover = cell ? [Number(cell.dataset.r), Number(cell.dataset.c)] : null;
   const ghost = $('#ghost');
   ghost.hidden = Boolean(placing.hover);
   ghost.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
-  render();
+  renderMyBoard();
 }
 
 // The 2 px gap between cells is part of the board, not of a cell. A drop
@@ -595,7 +602,12 @@ function endDrag(cancel = false) {
   setTimeout(() => { suppressClick = false; }, 0);
   document.body.classList.remove('dragging');
   $('#ghost').hidden = true;
-  if ((cancel || !dropSelected()) && origin) {
+  const overBoard = Boolean(placing.hover);
+  const dropped = !cancel && dropSelected();
+  if (!dropped && overBoard && !cancel) {
+    toast('Daar past het schip niet. Schepen mogen elkaar niet raken, ook niet schuin.', 'bad');
+  }
+  if (!dropped && origin) {
     state.myShips.push(origin);
     selectShip(nextUnplaced());
   }
@@ -715,8 +727,7 @@ function bindControls() {
   $('#picker').addEventListener('click', (e) => {
     const item = e.target.closest('[data-ship]');
     if (!item || !canEditFleet() || suppressClick) return;
-    const placed = state.myShips.find((s) => s.id === item.dataset.ship);
-    if (placed) pickUp(placed);
+    if (state.myShips.some((s) => s.id === item.dataset.ship)) toast(MOVE_HINT);
     else selectShip(item.dataset.ship);
     save();
     render();
@@ -724,6 +735,7 @@ function bindControls() {
   document.addEventListener('pointermove', moveDrag);
   document.addEventListener('pointerup', () => endDrag());
   document.addEventListener('pointercancel', () => endDrag(true));
+  window.addEventListener('blur', () => endDrag(true));
   document.addEventListener('contextmenu', (e) => {
     if (!canEditFleet() || !(drag || e.target.closest?.('#my-board'))) return;
     e.preventDefault();
