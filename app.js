@@ -56,7 +56,9 @@ function newState(gameId, role) {
 const storageKey = () => `zeeslag:${state.gameId}:${state.role}`;
 
 function save() {
-  try { localStorage.setItem(storageKey(), JSON.stringify(state)); } catch { /* private mode */ }
+  // A ship that is being dragged is out of myShips; a reload must not lose it.
+  const snapshot = drag?.moved && drag.origin ? { ...state, myShips: [...state.myShips, drag.origin] } : state;
+  try { localStorage.setItem(storageKey(), JSON.stringify(snapshot)); } catch { /* private mode */ }
 }
 
 function load(gameId, role) {
@@ -242,9 +244,11 @@ function heartbeat() {
 
 const isConnected = () => Boolean(linked?.open);
 
-// Each saved game has a session id. A hello with another session id than the
-// one this game was first played with means a second browser or a lost save;
-// mixing the two would corrupt both games, so that link is refused.
+// Each saved game has a session id. Once the two sides have exchanged a game
+// message, a hello with another session id means a second browser or a lost
+// save; mixing the two would corrupt both games, so that link is refused.
+// Before that, a new session may replace the old one (for example, the host
+// tried the invite link in its own browser first).
 function sendHello() {
   if (conn?.open) conn.send({ type: 'hello', session: state.sessionId, linked: linked === conn });
 }
@@ -252,7 +256,8 @@ function sendHello() {
 function onHello(msg) {
   if (typeof msg.session !== 'string') return;
   if (linked !== conn) {
-    state.oppSession ??= msg.session;
+    const untouched = state.net.inSeq === 0 && state.net.outbox.length === state.net.outSeq;
+    if (!state.oppSession || untouched) state.oppSession = msg.session;
     if (msg.session !== state.oppSession) return refuse(conn);
     linked = conn;
     netProblem = null;
@@ -485,7 +490,7 @@ function dropSelected() {
 
 function clickCell(r, c) {
   const owner = shipAtCell(r, c);
-  if (owner) pickUp(owner);
+  if (owner) pickUp(owner, owner.cells.findIndex(([sr, sc]) => sr === r && sc === c));
   else if (placing.selected) dropSelected();
   save();
   render();
@@ -506,6 +511,7 @@ function startDrag(e, id, origin, offset) {
 
 function moveDrag(e) {
   if (!drag) return;
+  if (!(e.buttons & 1)) return endDrag(true);
   if (!drag.moved) {
     if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD_PX) return;
     drag.moved = true;
@@ -514,15 +520,25 @@ function moveDrag(e) {
     document.body.classList.add('dragging');
     updateGhost();
   }
-  const cell = document.elementFromPoint(e.clientX, e.clientY)?.closest('#my-board .cell');
+  const cell = boardCellAt(e.clientX, e.clientY);
   placing.hover = cell ? [Number(cell.dataset.r), Number(cell.dataset.c)] : null;
   const ghost = $('#ghost');
-  ghost.hidden = Boolean(cell);
+  ghost.hidden = Boolean(placing.hover);
   ghost.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
   render();
 }
 
-function endDrag() {
+// The 2 px gap between cells is part of the board, not of a cell. A drop
+// there must still land on the nearest cell, so look 2 px around the point.
+function boardCellAt(x, y) {
+  for (const [dx, dy] of [[0, 0], [-2, 0], [2, 0], [0, -2], [0, 2], [-2, -2], [2, 2], [-2, 2], [2, -2]]) {
+    const cell = document.elementFromPoint(x + dx, y + dy)?.closest?.('#my-board .cell');
+    if (cell) return cell;
+  }
+  return null;
+}
+
+function endDrag(cancel = false) {
   if (!drag) return;
   const { moved, origin } = drag;
   drag = null;
@@ -531,7 +547,7 @@ function endDrag() {
   setTimeout(() => { suppressClick = false; }, 0);
   document.body.classList.remove('dragging');
   $('#ghost').hidden = true;
-  if (!dropSelected() && origin) {
+  if ((cancel || !dropSelected()) && origin) {
     state.myShips.push(origin);
     selectShip(nextUnplaced());
   }
@@ -658,8 +674,8 @@ function bindControls() {
     render();
   });
   document.addEventListener('pointermove', moveDrag);
-  document.addEventListener('pointerup', endDrag);
-  document.addEventListener('pointercancel', endDrag);
+  document.addEventListener('pointerup', () => endDrag());
+  document.addEventListener('pointercancel', () => endDrag(true));
   document.addEventListener('contextmenu', (e) => {
     if (!canEditFleet() || !(drag || e.target.closest('#my-board'))) return;
     e.preventDefault();
@@ -684,6 +700,7 @@ function render() {
   $('#net-text').textContent = connected ? 'Verbonden' : netProblem ?? 'Wachten op je tegenstander…';
 
   $('#invite').hidden = !(state.role === 'host' && !connected && !blocked);
+  $('#boards').hidden = blocked;
   $('#placement').hidden = phase !== 'placing';
   $('#opp-wrap').hidden = phase === 'placing';
   $('#over-actions').hidden = phase !== 'over' || blocked;

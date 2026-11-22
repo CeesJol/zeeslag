@@ -202,7 +202,7 @@ button.big { padding: 12px 26px; font-size: 18px; }
 
 .board.editing .cell { cursor: pointer; }
 .board.editing .cell.ship { cursor: grab; }
-.board.editing .cell.ship:hover { filter: brightness(1.15); }
+.board.editing .cell.ship:not(.preview-ok, .preview-bad):hover { filter: brightness(1.15); }
 #my-board, #picker { touch-action: none; }
 body.dragging, body.dragging * { cursor: grabbing !important; user-select: none; }
 .cell.preview-ok { background: #3ccf8e99; box-shadow: none; }
