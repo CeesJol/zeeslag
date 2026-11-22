@@ -15,6 +15,7 @@ let peer = null;
 let conn = null;
 let lastSeen = 0;
 let dialTimer = null;
+let pendingConn = null;
 let hostRetries = 0;
 let netProblem = null;
 const placing = { selected: FLEET[0].id, horizontal: true, hover: null };
@@ -37,6 +38,12 @@ function freshRound() {
     rematchOpp: false,
     lastIncoming: null,
     lastOutgoing: null,
+  };
+}
+
+function newState(gameId, role) {
+  return {
+    gameId, role, round: 1, score: { me: 0, opp: 0 }, net: { outSeq: 0, inSeq: 0, outbox: [] }, ...freshRound(),
   };
 }
 
@@ -68,7 +75,8 @@ function init() {
   if (!gameId) return showHome();
   if (!/^[a-z0-9]{6,16}$/.test(gameId)) return showHome('Deze link klopt niet. Start een nieuw spel.');
   const role = flag === 'h' ? 'host' : 'guest';
-  state = load(gameId, role) ?? { gameId, role, round: 1, score: { me: 0, opp: 0 }, ...freshRound() };
+  state = load(gameId, role) ?? newState(gameId, role);
+  placing.selected = nextUnplaced();
   save();
   startGame();
 }
@@ -93,7 +101,7 @@ function startGame() {
 }
 
 function newGame() {
-  state = { gameId: randomId(), role: 'host', round: 1, score: { me: 0, opp: 0 }, ...freshRound() };
+  state = newState(randomId(), 'host');
   history.replaceState(null, '', `#${state.gameId}/h`);
   save();
   startGame();
@@ -101,41 +109,48 @@ function newGame() {
 
 // The host owns the peer id in the link and the guest dials it. Ships stay in
 // the owner's browser until the round ends, so nobody can peek.
-
 function openHost() {
   const p = new Peer(PEER_PREFIX + state.gameId, { debug: 0 });
   peer = p;
   p.on('open', () => { hostRetries = 0; netProblem = null; render(); });
   p.on('connection', attach);
-  p.on('disconnected', () => { if (!p.destroyed) p.reconnect(); });
-  p.on('error', (err) => {
-    if (err.type === 'unavailable-id') {
-      hostRetries++;
-      netProblem = hostRetries > 4 ? 'Dit spel is al open in een ander venster.' : null;
-      p.destroy();
-      setTimeout(openHost, 2500);
-    } else if (['network', 'server-error', 'socket-error', 'socket-closed', 'browser-incompatible'].includes(err.type)) {
-      netProblem = 'Geen verbinding met de server. Opnieuw proberen…';
-      p.destroy();
-      setTimeout(openHost, 3000);
-    }
-    render();
-  });
+  watchSignaling(p, () => {
+    hostRetries++;
+    netProblem = hostRetries > 4 ? 'Dit spel is al open in een ander venster.' : null;
+    setTimeout(openHost, 2500);
+  }, openHost);
 }
 
 function openGuest() {
   const p = new Peer({ debug: 0 });
   peer = p;
   p.on('open', () => { netProblem = null; dial(); });
-  p.on('disconnected', () => { if (!p.destroyed) p.reconnect(); });
   p.on('error', (err) => {
-    if (err.type === 'peer-unavailable') {
-      scheduleDial(DIAL_RETRY_MS);
-    } else if (['network', 'server-error', 'socket-error', 'socket-closed', 'browser-incompatible'].includes(err.type)) {
-      netProblem = 'Geen verbinding met de server. Opnieuw proberen…';
-      clearTimeout(dialTimer);
+    if (err.type !== 'peer-unavailable') return;
+    pendingConn?.close();
+    pendingConn = null;
+    scheduleDial(DIAL_RETRY_MS);
+  });
+  watchSignaling(p, null, openGuest);
+}
+
+// The signaling server is only needed to set up a connection. Losing it must
+// not end an open game connection, so a known peer reconnects instead of
+// being destroyed.
+function watchSignaling(p, onIdTaken, reopen) {
+  const retry = () => setTimeout(() => {
+    if (p !== peer) return;
+    if (p.destroyed) reopen();
+    else if (p.disconnected) p.reconnect();
+  }, 3000);
+  p.on('disconnected', retry);
+  p.on('error', (err) => {
+    if (err.type === 'unavailable-id' && onIdTaken) {
       p.destroy();
-      setTimeout(openGuest, 3000);
+      onIdTaken();
+    } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
+      netProblem = 'Geen verbinding met de server. Opnieuw proberen…';
+      if (p.destroyed) retry();
     }
     render();
   });
@@ -148,14 +163,17 @@ function scheduleDial(ms) {
 
 function dial() {
   if (conn || !peer || peer.destroyed || !peer.open) return;
-  attach(peer.connect(PEER_PREFIX + state.gameId, { reliable: true, serialization: 'json' }));
+  pendingConn?.close();
+  pendingConn = peer.connect(PEER_PREFIX + state.gameId, { reliable: true, serialization: 'json' });
+  attach(pendingConn);
   scheduleDial(DIAL_RETRY_MS * 2);
 }
 
 function attach(c) {
   c.on('open', () => {
+    if (state.role === 'guest' && c !== pendingConn) { c.close(); return; }
+    pendingConn = null;
     if (conn && conn !== c) {
-      if (state.role === 'guest') { c.close(); return; }
       const old = conn;
       conn = null;
       old.close();
@@ -163,13 +181,13 @@ function attach(c) {
     conn = c;
     clearTimeout(dialTimer);
     lastSeen = Date.now();
-    sendSync();
+    flushOutbox();
     render();
   });
   c.on('data', (msg) => {
     if (c !== conn) return;
     lastSeen = Date.now();
-    onMessage(msg);
+    receive(msg);
   });
   c.on('close', () => dropConn(c));
   c.on('error', () => dropConn(c));
@@ -186,7 +204,8 @@ function dropConn(c) {
 function heartbeat() {
   if (!conn) return;
   if (Date.now() - lastSeen > TIMEOUT_MS) return dropConn(conn);
-  send({ type: 'ping' });
+  send({ type: 'ping', ack: state.net.inSeq });
+  flushOutbox();
 }
 
 function send(msg) {
@@ -195,61 +214,61 @@ function send(msg) {
 
 const isConnected = () => Boolean(conn?.open);
 
-// Sent on every (re)connect so that a message lost during a drop is repaired.
-function sendSync() {
-  send({ type: 'sync', round: state.round, phase: state.phase, ready: state.myReady, rematch: state.rematchMe });
-  if (state.phase === 'playing' && state.pendingShot) {
-    send({ type: 'shot', round: state.round, ...state.pendingShot });
-  }
-  if (state.phase === 'over') send({ type: 'reveal', round: state.round, ships: state.myShips });
+// Game messages are numbered and kept until the other side acknowledges them,
+// and both sides persist the counters. So each message is applied exactly
+// once and in order, also across a dead link, a reconnect or a reload.
+function post(msg) {
+  const m = { ...msg, seq: ++state.net.outSeq };
+  state.net.outbox.push(m);
+  send(m);
 }
 
+function flushOutbox() {
+  for (const m of state.net.outbox) send(m);
+}
+
+function receive(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  if (typeof msg.ack === 'number') {
+    state.net.outbox = state.net.outbox.filter((m) => m.seq > msg.ack);
+  }
+  if (typeof msg.seq !== 'number') return save();
+  if (msg.seq === state.net.inSeq + 1) {
+    state.net.inSeq = msg.seq;
+    onMessage(msg);
+  }
+  send({ type: 'ack', ack: state.net.inSeq });
+  save();
+  render();
+}
 
 function onMessage(msg) {
-  if (!msg || typeof msg !== 'object') return;
   switch (msg.type) {
-    case 'sync': onSync(msg); break;
     case 'ready':
       if (msg.round !== state.round) return;
-      state.oppReady = Boolean(msg.ready);
+      state.oppReady = true;
       maybeStart();
       break;
     case 'start': onStart(msg); break;
     case 'shot': onShot(msg); break;
     case 'result': onResult(msg); break;
     case 'reveal':
-      if (msg.round === state.round && state.phase === 'over' && Array.isArray(msg.ships)) state.oppReveal = msg.ships;
+      if (msg.round === state.round && Array.isArray(msg.ships)) state.oppReveal = msg.ships;
       break;
     case 'rematch':
       if (msg.round !== state.round || state.phase !== 'over') return;
       state.rematchOpp = true;
       maybeRematch();
       break;
-    default: return;
+    default:
   }
-  save();
-  render();
-}
-
-function onSync(msg) {
-  if (msg.round === state.round + 1 && state.phase === 'over' && state.rematchMe) {
-    nextRound();
-  }
-  if (msg.round !== state.round) return;
-  state.oppReady = Boolean(msg.ready);
-  if (state.phase === 'over') state.rematchOpp = Boolean(msg.rematch);
-  if (state.role === 'host' && state.phase === 'playing' && msg.phase === 'placing') {
-    send({ type: 'start', round: state.round, hostStarts: state.hostStarts });
-  }
-  maybeStart();
-  maybeRematch();
 }
 
 function maybeStart() {
   if (state.role !== 'host' || state.phase !== 'placing' || !state.myReady || !state.oppReady) return;
   state.hostStarts = Math.random() < 0.5;
   beginPlaying();
-  send({ type: 'start', round: state.round, hostStarts: state.hostStarts });
+  post({ type: 'start', round: state.round, hostStarts: state.hostStarts });
 }
 
 function onStart(msg) {
@@ -269,12 +288,10 @@ function onShot(msg) {
   if (msg.round !== state.round || !Number.isInteger(r) || !Number.isInteger(c)) return;
   if (r < 0 || r >= SIZE || c < 0 || c >= SIZE) return;
   const k = key(r, c);
-  const repeat = k in state.incoming;
-  if (!repeat && (state.phase !== 'playing' || state.myTurn)) return;
+  if (k in state.incoming || state.phase !== 'playing' || state.myTurn) return;
 
   const res = resolveShot(state.myShips, Object.keys(state.incoming), r, c);
-  send({ type: 'result', round: state.round, r, c, result: res.result, ship: res.ship ?? null, allSunk: Boolean(res.allSunk) });
-  if (repeat) return;
+  post({ type: 'result', round: state.round, r, c, result: res.result, ship: res.ship ?? null, allSunk: Boolean(res.allSunk) });
 
   state.incoming[k] = res.result === 'miss' ? 'miss' : 'hit';
   state.lastIncoming = k;
@@ -309,7 +326,7 @@ function endRound(winner) {
   state.winner = winner;
   state.myTurn = false;
   state.score[winner]++;
-  send({ type: 'reveal', round: state.round, ships: state.myShips });
+  post({ type: 'reveal', round: state.round, ships: state.myShips });
 }
 
 function maybeRematch() {
@@ -326,7 +343,7 @@ function nextRound() {
 function fire(r, c) {
   if (!canFire() || key(r, c) in state.outgoing) return;
   state.pendingShot = { r, c };
-  send({ type: 'shot', round: state.round, r, c });
+  post({ type: 'shot', round: state.round, r, c });
   save();
   render();
 }
@@ -336,7 +353,7 @@ const canFire = () => isConnected() && state.phase === 'playing' && state.myTurn
 function markReady() {
   if (!isValidFleet(state.myShips)) return;
   state.myReady = true;
-  send({ type: 'ready', round: state.round, ready: true });
+  post({ type: 'ready', round: state.round, ready: true });
   maybeStart();
   save();
   render();
@@ -345,14 +362,14 @@ function markReady() {
 function requestRematch() {
   if (state.phase !== 'over' || state.rematchMe) return;
   state.rematchMe = true;
-  send({ type: 'rematch', round: state.round });
+  post({ type: 'rematch', round: state.round });
   maybeRematch();
   save();
   render();
 }
 
 
-const canEditFleet = () => state.phase === 'placing' && !state.myReady;
+const canEditFleet = () => state?.phase === 'placing' && !state.myReady;
 const nextUnplaced = () => FLEET.find((d) => !state.myShips.some((s) => s.id === d.id))?.id ?? null;
 
 function previewCells() {
@@ -374,7 +391,7 @@ function placeAt(r, c) {
   const owner = state.myShips.find((s) => s.cells.some(([sr, sc]) => sr === r && sc === c));
   if (owner) {
     pickUp(owner.id);
-  } else if (placing.selected) {
+  } else if (placing.selected && !state.myShips.some((s) => s.id === placing.selected)) {
     const preview = previewCells();
     if (!preview?.ok) return;
     state.myShips.push({ id: placing.selected, cells: preview.cells });
