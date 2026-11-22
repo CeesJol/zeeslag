@@ -11,8 +11,18 @@ const TIMEOUT_MS = 12000;
 const DRAG_THRESHOLD_PX = 5;
 const DROP_MARGIN_PX = 48;
 const SHOT_FLIGHT_MS = 450;
+const NAME_KEY = 'zeeslag:name';
+const NAME_MAX = 20;
 
 const $ = (sel) => document.querySelector(sel);
+
+const cleanName = (name) => (typeof name === 'string' ? name.replace(/\s+/g, ' ').trim().slice(0, NAME_MAX) : '');
+// The last name typed is the default for new games; each game keeps its own,
+// so a host and a guest tab in one browser do not share a name.
+function defaultName() {
+  try { return cleanName(localStorage.getItem(NAME_KEY)); } catch { return ''; }
+}
+const oppName = (capital) => state.oppName || (capital ? 'Je tegenstander' : 'je tegenstander');
 
 let state = null;
 let clients = [];
@@ -118,6 +128,7 @@ function startGame() {
   state.net ??= { outSeq: 0, inSeq: 0, outbox: [] };
   state.sessionId ??= randomId();
   state.oppSession ??= null;
+  state.myName ??= defaultName();
   placing.selected = nextUnplaced();
   save();
   $('#home').hidden = true;
@@ -127,6 +138,8 @@ function startGame() {
   $('#sound').hidden = false;
   $('#net').hidden = false;
   $('#invite-link').value = inviteLink();
+  $('#my-name').value = state.myName;
+  fitNameInput();
   openTransport();
   setInterval(heartbeat, HEARTBEAT_MS);
   render();
@@ -203,7 +216,14 @@ const isConnected = () => linked && brokerUp();
 // Before that, a new session may replace the old one (for example, the host
 // tried the invite link in its own browser first).
 function sendHello() {
-  if (!blocked) send({ type: 'hello', session: state.sessionId, linked });
+  if (!blocked) send({ type: 'hello', session: state.sessionId, linked, name: state.myName });
+}
+
+function setOppName(name) {
+  if (typeof name !== 'string' || cleanName(name) === (state.oppName ?? '')) return;
+  state.oppName = cleanName(name);
+  save();
+  render();
 }
 
 function onHello(msg) {
@@ -212,8 +232,9 @@ function onHello(msg) {
     const untouched = state.net.inSeq === 0 && state.net.outbox.length === state.net.outSeq;
     if (!state.oppSession || untouched) state.oppSession = msg.session;
     if (msg.session !== state.oppSession) return send({ type: 'busy', to: msg.session });
+    setOppName(msg.name);
     if (!linked) {
-      toast(wasLinked ? 'Weer verbonden met je tegenstander.' : 'Je tegenstander is verbonden!', 'good');
+      toast(wasLinked ? `Weer verbonden met ${oppName()}.` : `${oppName(true)} is verbonden!`, 'good');
       wasLinked = true;
     }
     linked = true;
@@ -238,7 +259,7 @@ function onBusy(msg) {
 }
 
 function transmit(msg) {
-  if (linked) send({ ...msg, from: state.sessionId, to: state.oppSession });
+  if (linked) send({ ...msg, name: state.myName, from: state.sessionId, to: state.oppSession });
 }
 
 // Game messages are numbered and kept until the other side acknowledges them,
@@ -260,6 +281,7 @@ function receive(msg) {
   if (msg.type === 'busy') return onBusy(msg);
   if (!linked || msg.from !== state.oppSession || msg.to !== state.sessionId) return;
   lastSeen = Date.now();
+  setOppName(msg.name);
   if (typeof msg.ack === 'number') {
     state.net.outbox = state.net.outbox.filter((m) => m.seq > msg.ack);
   }
@@ -287,7 +309,7 @@ function onMessage(msg) {
       if (msg.round === state.round && Array.isArray(msg.ships)) state.oppReveal = msg.ships;
       break;
     case 'love':
-      toast('♥ Ik hou van jou', 'love');
+      toast(state.oppName ? `♥ ${state.oppName}: ik hou van jou` : '♥ Ik hou van jou', 'love');
       floatHearts(9);
       sfx.love();
       break;
@@ -316,7 +338,7 @@ function onStart(msg) {
 function beginPlaying() {
   state.phase = 'playing';
   state.myTurn = (state.role === 'host') === state.hostStarts;
-  toast(state.myTurn ? 'Jij mag beginnen!' : 'Je tegenstander begint.');
+  toast(state.myTurn ? 'Jij mag beginnen!' : `${oppName(true)} begint.`);
 }
 
 function onShot(msg) {
@@ -334,9 +356,9 @@ function onShot(msg) {
   sfx.fire();
   playResult(res.result, res.allSunk ? 'lose' : null, SHOT_FLIGHT_MS);
   const where = coordName(r, c);
-  if (res.result === 'miss') toast(`Je tegenstander schoot op ${where}: mis.`);
-  else if (res.result === 'hit') toast(`Je tegenstander schoot op ${where}: raak!`, 'bad');
-  else toast(`Je tegenstander liet je ${shipName(res.ship.id).toLowerCase()} zinken.`, 'bad');
+  if (res.result === 'miss') toast(`${oppName(true)} schoot op ${where}: mis.`);
+  else if (res.result === 'hit') toast(`${oppName(true)} schoot op ${where}: raak!`, 'bad');
+  else toast(`${oppName(true)} liet je ${shipName(res.ship.id).toLowerCase()} zinken.`, 'bad');
 
   if (res.allSunk) endRound('opp');
   else state.myTurn = true;
@@ -710,6 +732,21 @@ function bindControls() {
     renderSound();
   });
   $('#volume').addEventListener('change', () => sfx.tick());
+  const nameInput = $('#my-name');
+  nameInput.addEventListener('input', () => {
+    state.myName = cleanName(nameInput.value);
+    save();
+    try { localStorage.setItem(NAME_KEY, state.myName); } catch { /* no storage */ }
+    fitNameInput();
+  });
+  nameInput.addEventListener('change', () => {
+    nameInput.value = state.myName;
+    fitNameInput();
+    transmit({ type: 'ping', ack: state.net.inSeq });
+  });
+  nameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') nameInput.blur();
+  });
   for (const type of ['pointerdown', 'keydown']) document.addEventListener(type, sfx.unlock, true);
   $('#copy').addEventListener('click', async () => {
     const input = $('#invite-link');
@@ -775,7 +812,8 @@ function bindControls() {
   });
   // Space would also scroll the page or press the focused button (on keyup),
   // so both events are blocked while ships are placed.
-  const isRotateKey = (e) => e.code === 'Space' && !e.metaKey && !e.ctrlKey && !e.altKey && canEditFleet();
+  const isRotateKey = (e) => e.code === 'Space' && !e.metaKey && !e.ctrlKey && !e.altKey && canEditFleet()
+    && !e.target.matches?.('input[type="text"]');
   document.addEventListener('keydown', (e) => {
     if (!isRotateKey(e)) return;
     e.preventDefault();
@@ -794,12 +832,15 @@ function render() {
   const connected = isConnected();
   const { phase } = state;
 
-  $('#score').innerHTML = `Jij <b>${state.score.me}</b> – <b>${state.score.opp}</b> Tegenstander`;
+  $('#score-me').textContent = state.score.me;
+  $('#score-opp').textContent = state.score.opp;
+  $('#opp-name').textContent = state.oppName || 'Tegenstander';
+  $('#opp-title').textContent = state.oppName || 'Tegenstander';
   $('#net').className = connected ? 'ok' : blocked ? 'blocked' : 'wait';
   $('#love').disabled = !connected || loveCooling;
   renderSound();
   $('#net-text').textContent = connected ? 'Verbonden'
-    : netProblem ?? (brokerUp() ? 'Wachten op je tegenstander…' : 'Verbinden met de server…');
+    : netProblem ?? (brokerUp() ? `Wachten op ${oppName()}…` : 'Verbinden met de server…');
 
   $('#invite').hidden = !(state.role === 'host' && !connected && !blocked);
   $('#boards').hidden = blocked;
@@ -815,8 +856,8 @@ function render() {
   if (phase === 'over') {
     $('#rematch').disabled = state.rematchMe;
     $('#rematch-note').textContent = state.rematchMe
-      ? 'Wachten tot je tegenstander ook op "Nog een potje" klikt…'
-      : state.rematchOpp ? 'Je tegenstander wil nog een potje!' : '';
+      ? `Wachten tot ${oppName()} ook op "Nog een potje" klikt…`
+      : state.rematchOpp ? `${oppName(true)} wil nog een potje!` : '';
   }
   document.title = phase === 'playing' && state.myTurn && !state.pendingShot ? '🎯 Jouw beurt – Zeeslag' : 'Zeeslag';
 }
@@ -832,13 +873,13 @@ function renderStatus(connected) {
     tone = 'lose';
   } else if (state.phase === 'placing') {
     if (!state.myReady) text = 'Plaats je schepen en klik op Klaar.';
-    else if (!state.oppReady) text = 'Klaar! Wachten tot je tegenstander de schepen heeft geplaatst…';
+    else if (!state.oppReady) text = `Klaar! Wachten tot ${oppName()} de schepen heeft geplaatst…`;
     else text = 'Het spel begint…';
   } else if (state.phase === 'playing') {
-    if (!connected) text = 'Geen verbinding met je tegenstander. Even wachten…';
+    if (!connected) text = `Geen verbinding met ${oppName()}. Even wachten…`;
     else if (state.pendingShot) text = `Schot op ${coordName(state.pendingShot.r, state.pendingShot.c)}…`;
-    else if (state.myTurn) { text = 'Jij bent aan de beurt. Kies een vakje bij de tegenstander.'; tone = 'turn'; }
-    else text = 'Je tegenstander is aan de beurt…';
+    else if (state.myTurn) { text = `Jij bent aan de beurt. Kies een vakje bij ${state.oppName || 'de tegenstander'}.`; tone = 'turn'; }
+    else text = `${oppName(true)} is aan de beurt…`;
   } else {
     text = state.winner === 'me' ? 'Gewonnen! Je hebt de hele vloot laten zinken.' : 'Verloren. Je hele vloot is gezonken.';
     tone = state.winner === 'me' ? 'win' : 'lose';
@@ -923,8 +964,16 @@ function renderPlacement() {
   $('#ready').disabled = !editable || !isFleetComplete(state.myShips);
   $('#ready').textContent = state.myReady ? 'Klaar ✓' : 'Klaar';
   $('#opp-ready').textContent = isConnected()
-    ? (state.oppReady ? 'Je tegenstander is klaar.' : 'Je tegenstander plaatst nog schepen.')
+    ? (state.oppReady ? `${oppName(true)} is klaar.` : `${oppName(true)} plaatst nog schepen.`)
     : '';
+}
+
+const measure = document.createElement('canvas').getContext('2d');
+function fitNameInput() {
+  const input = $('#my-name');
+  const css = getComputedStyle(input);
+  measure.font = `${css.fontWeight} ${css.fontSize} ${css.fontFamily}`;
+  input.style.width = `${Math.ceil(measure.measureText(input.value || input.placeholder).width) + 8}px`;
 }
 
 function renderSound() {

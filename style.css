@@ -53,6 +53,16 @@ h2 {
 
 #score { font-size: 18px; }
 #score b { color: var(--gold); font-size: 22px; }
+#my-name {
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px dashed var(--muted);
+  padding: 0 2px;
+}
+#my-name::placeholder { color: var(--gold); opacity: 0.8; }
+#my-name:hover, #my-name:focus { outline: none; border-bottom-color: var(--gold); }
 
 #net {
   margin-left: auto;

@@ -15,7 +15,11 @@
 <body>
   <header>
     <h1>Zeeslag</h1>
-    <div id="score" hidden></div>
+    <div id="score" hidden>
+      <input id="my-name" type="text" maxlength="20" placeholder="Jouw naam" aria-label="Jouw naam" title="Klik om je naam te veranderen" autocomplete="nickname" spellcheck="false">
+      <b id="score-me">0</b> – <b id="score-opp">0</b>
+      <span id="opp-name">Tegenstander</span>
+    </div>
     <button id="love" hidden aria-label="Stuur: ik hou van jou">♥ ik hou van jou</button>
     <div id="sound" hidden>
       <button id="mute">🔊</button>
@@ -58,7 +62,7 @@
         </div>
 
         <div class="board-wrap" id="opp-wrap">
-          <h2>Tegenstander</h2>
+          <h2 id="opp-title">Tegenstander</h2>
           <div class="board" id="opp-board"></div>
           <ul class="fleet" id="opp-fleet"></ul>
         </div>
