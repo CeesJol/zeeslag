@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zeeslag</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Black+Ops+One&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚓</text></svg>">
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Zeeslag</h1>
+    <div id="score" hidden></div>
+    <div id="net" hidden><span class="dot"></span><span id="net-text"></span></div>
+  </header>
+
+  <main>
+    <section id="home" hidden>
+      <p class="lead">Speel zeeslag tegen iemand anders, elk op je eigen laptop.</p>
+      <ol class="rules">
+        <li>Klik op <strong>Nieuw spel</strong> en stuur de link naar je tegenstander.</li>
+        <li>Plaats je vijf schepen: 5, 4, 3, 3 en 2 vakjes lang. Schepen mogen elkaar niet raken.</li>
+        <li>Om de beurt schiet je één schot. Ook bij raak is daarna de ander aan de beurt.</li>
+        <li>Wie als eerste alle schepen van de ander laat zinken, wint.</li>
+      </ol>
+      <button id="new-game" class="primary big">Nieuw spel</button>
+      <p id="home-error" class="error" hidden></p>
+    </section>
+
+    <section id="game" hidden>
+      <div id="invite" hidden>
+        <span>Stuur deze link naar je tegenstander:</span>
+        <input id="invite-link" readonly>
+        <button id="copy" class="primary">Kopieer</button>
+      </div>
+
+      <div id="status"></div>
+      <div id="over-actions" hidden>
+        <button id="rematch" class="primary big">Nog een potje</button>
+        <span id="rematch-note"></span>
+      </div>
+
+      <div id="boards">
+        <div class="board-wrap" id="my-wrap">
+          <h2>Jouw vloot</h2>
+          <div class="board" id="my-board"></div>
+          <ul class="fleet" id="my-fleet"></ul>
+        </div>
+
+        <div class="board-wrap" id="opp-wrap">
+          <h2>Tegenstander</h2>
+          <div class="board" id="opp-board"></div>
+          <ul class="fleet" id="opp-fleet"></ul>
+        </div>
+
+        <aside id="placement">
+          <h2>Jouw schepen</h2>
+          <ul id="picker"></ul>
+          <p class="hint">Klik op een schip en dan op het veld. Draaien: toets <kbd>R</kbd> of rechtermuisknop. Klik op een geplaatst schip om het te verplaatsen.</p>
+          <div class="buttons">
+            <button id="rotate">Draai</button>
+            <button id="random">Willekeurig</button>
+            <button id="clear">Wissen</button>
+          </div>
+          <button id="ready" class="primary big">Klaar</button>
+          <p id="opp-ready" class="muted"></p>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
