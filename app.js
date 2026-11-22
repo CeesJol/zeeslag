@@ -24,6 +24,7 @@ let blocked = false;
 let wasLinked = false;
 const placing = { selected: null, horizontal: true, hover: null, offset: 0 };
 let drag = null;
+let pointer = null;
 let suppressClick = false;
 let clearArmed = false;
 let clearTimer = null;
@@ -496,12 +497,35 @@ function clickCell(r, c) {
   render();
 }
 
-function rotate() {
+// Rotates the ship in hand around the cell under the pointer. Without a ship
+// in hand, a placed ship under the pointer turns in place.
+function rotate(x = pointer?.[0], y = pointer?.[1]) {
   if (!canEditFleet()) return;
+  const cell = x === undefined ? null : boardCellAt(x, y);
+  const rc = cell && [Number(cell.dataset.r), Number(cell.dataset.c)];
+  const placed = rc && !drag?.moved && shipAtCell(...rc);
+  if (placed) return rotatePlaced(placed, rc);
   placing.horizontal = !placing.horizontal;
-  placing.offset = 0;
+  if (rc) placing.hover = rc;
   updateGhost();
   render();
+}
+
+function rotatePlaced(ship, [r, c]) {
+  const others = state.myShips.filter((s) => s !== ship);
+  const horizontal = !isHorizontal(ship);
+  const pivot = ship.cells.findIndex(([sr, sc]) => sr === r && sc === c);
+  const order = [pivot, ...ship.cells.keys()].filter((i, n, all) => all.indexOf(i) === n);
+  for (const i of order) {
+    const cells = shipCells(horizontal ? r : r - i, horizontal ? c - i : c, ship.cells.length, horizontal);
+    if (canPlace(others, cells)) {
+      ship.cells = cells;
+      save();
+      render();
+      return;
+    }
+  }
+  toast('Hier is geen ruimte om dit schip te draaien.', 'bad');
 }
 
 function startDrag(e, id, origin, offset) {
@@ -510,8 +534,14 @@ function startDrag(e, id, origin, offset) {
 }
 
 function moveDrag(e) {
+  pointer = [e.clientX, e.clientY];
   if (!drag) return;
   if (!(e.buttons & 1)) return endDrag(true);
+  // Chrome sends no contextmenu event while the left button is down, so a
+  // right-button press during a drag only shows up here.
+  const right = Boolean(e.buttons & 2);
+  if (right && !drag.right && drag.moved) rotate(e.clientX, e.clientY);
+  drag.right = right;
   if (!drag.moved) {
     if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD_PX) return;
     drag.moved = true;
@@ -608,7 +638,7 @@ function buildBoard(el, side) {
   el.addEventListener('pointerdown', (e) => {
     const rc = cellOf(e);
     const ship = rc && canEditFleet() && shipAtCell(...rc);
-    if (!ship) return;
+    if (!ship || e.button !== 0) return;
     e.preventDefault();
     const offset = ship.cells.findIndex(([r, c]) => r === rc[0] && c === rc[1]);
     startDrag(e, ship.id, ship, offset);
@@ -635,7 +665,7 @@ function label(text) {
 
 function bindControls() {
   $('#new-game').addEventListener('click', newGame);
-  $('#rotate').addEventListener('click', rotate);
+  $('#rotate').addEventListener('click', () => rotate(undefined));
   $('#random').addEventListener('click', () => {
     if (!canEditFleet()) return;
     state.myShips = randomFleet();
@@ -659,7 +689,7 @@ function bindControls() {
   });
   $('#picker').addEventListener('pointerdown', (e) => {
     const item = e.target.closest('[data-ship]');
-    if (!item || !canEditFleet()) return;
+    if (!item || !canEditFleet() || e.button !== 0) return;
     e.preventDefault();
     const id = item.dataset.ship;
     startDrag(e, id, state.myShips.find((s) => s.id === id) ?? null, 0);
@@ -677,13 +707,16 @@ function bindControls() {
   document.addEventListener('pointerup', () => endDrag());
   document.addEventListener('pointercancel', () => endDrag(true));
   document.addEventListener('contextmenu', (e) => {
-    if (!canEditFleet() || !(drag || e.target.closest('#my-board'))) return;
+    if (!canEditFleet() || !(drag || e.target.closest?.('#my-board'))) return;
     e.preventDefault();
-    rotate();
+    if (!drag?.moved) rotate(e.clientX, e.clientY);
   });
   document.addEventListener('keydown', (e) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input')) return;
-    if (e.key === 'd' || e.key === 'D') rotate();
+    if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+    if (e.key === 'd' || e.key === 'D' || e.code === 'KeyD') {
+      e.preventDefault();
+      rotate();
+    }
   });
 }
 
@@ -747,7 +780,10 @@ function renderStatus(connected) {
 
 function renderMyBoard() {
   const shipAt = cellsOf(state.myShips);
-  const preview = canEditFleet() ? previewCells() : null;
+  // Over a placed ship the click picks that ship up, so the preview of the
+  // next ship would only hide what the click does.
+  const overShip = !drag?.moved && placing.hover && shipAtCell(...placing.hover);
+  const preview = canEditFleet() && !overShip ? previewCells() : null;
   const previewKeys = new Set(preview?.cells.map(([r, c]) => key(r, c)) ?? []);
   const board = $('#my-board');
   board.classList.toggle('editing', canEditFleet());
