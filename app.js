@@ -492,7 +492,10 @@ function dropSelected() {
 function clickCell(r, c) {
   const owner = shipAtCell(r, c);
   if (owner) pickUp(owner, owner.cells.findIndex(([sr, sc]) => sr === r && sc === c));
-  else if (placing.selected) dropSelected();
+  else if (placing.selected) {
+    placing.hover = [r, c];
+    dropSelected();
+  }
   save();
   render();
 }
@@ -501,28 +504,38 @@ function clickCell(r, c) {
 // in hand, a placed ship under the pointer turns in place.
 function rotate(x = pointer?.[0], y = pointer?.[1]) {
   if (!canEditFleet()) return;
-  const cell = x === undefined ? null : boardCellAt(x, y);
+  const cell = x == null ? null : boardCellAt(x, y);
   const rc = cell && [Number(cell.dataset.r), Number(cell.dataset.c)];
   const placed = rc && !drag?.moved && shipAtCell(...rc);
   if (placed) return rotatePlaced(placed, rc);
+  if (!placing.selected) {
+    toast('Wijs met de muis een schip aan en druk dan op D.');
+    return;
+  }
   placing.horizontal = !placing.horizontal;
   if (rc) placing.hover = rc;
   updateGhost();
   render();
 }
 
+// Prefers the turn around the pointed cell; when that has no room, any turned
+// position that still covers one of the ship's own cells is fine.
 function rotatePlaced(ship, [r, c]) {
   const others = state.myShips.filter((s) => s !== ship);
   const horizontal = !isHorizontal(ship);
-  const pivot = ship.cells.findIndex(([sr, sc]) => sr === r && sc === c);
-  const order = [pivot, ...ship.cells.keys()].filter((i, n, all) => all.indexOf(i) === n);
-  for (const i of order) {
-    const cells = shipCells(horizontal ? r : r - i, horizontal ? c - i : c, ship.cells.length, horizontal);
-    if (canPlace(others, cells)) {
-      ship.cells = cells;
-      save();
-      render();
-      return;
+  const { length } = ship.cells;
+  const pivots = [[r, c], ...ship.cells.filter(([sr, sc]) => sr !== r || sc !== c)];
+  for (const [pr, pc] of pivots) {
+    const at = ship.cells.findIndex(([sr, sc]) => sr === pr && sc === pc);
+    const order = [...ship.cells.keys()].sort((a, b) => Math.abs(a - at) - Math.abs(b - at));
+    for (const i of order) {
+      const cells = shipCells(horizontal ? pr : pr - i, horizontal ? pc - i : pc, length, horizontal);
+      if (canPlace(others, cells)) {
+        ship.cells = cells;
+        save();
+        render();
+        return;
+      }
     }
   }
   toast('Hier is geen ruimte om dit schip te draaien.', 'bad');
@@ -536,11 +549,16 @@ function startDrag(e, id, origin, offset) {
 function moveDrag(e) {
   pointer = [e.clientX, e.clientY];
   if (!drag) return;
-  if (!(e.buttons & 1)) return endDrag(true);
-  // Chrome sends no contextmenu event while the left button is down, so a
-  // right-button press during a drag only shows up here.
+  // Left button up while the right one is still down is a normal drop; no
+  // button down at all means the release happened outside the window.
+  if (!(e.buttons & 1)) return endDrag(!(e.buttons & 2));
+  // A right-button press during a drag shows up as a pointermove in Chrome;
+  // some browsers send contextmenu instead, so remember when it was handled.
   const right = Boolean(e.buttons & 2);
-  if (right && !drag.right && drag.moved) rotate(e.clientX, e.clientY);
+  if (right && !drag.right && drag.moved && !(Date.now() - drag.rightAt < 300)) {
+    drag.rightAt = Date.now();
+    rotate(e.clientX, e.clientY);
+  }
   drag.right = right;
   if (!drag.moved) {
     if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD_PX) return;
@@ -665,7 +683,7 @@ function label(text) {
 
 function bindControls() {
   $('#new-game').addEventListener('click', newGame);
-  $('#rotate').addEventListener('click', () => rotate(undefined));
+  $('#rotate').addEventListener('click', () => rotate(null));
   $('#random').addEventListener('click', () => {
     if (!canEditFleet()) return;
     state.myShips = randomFleet();
@@ -709,7 +727,11 @@ function bindControls() {
   document.addEventListener('contextmenu', (e) => {
     if (!canEditFleet() || !(drag || e.target.closest?.('#my-board'))) return;
     e.preventDefault();
-    if (!drag?.moved) rotate(e.clientX, e.clientY);
+    if (!drag?.moved) return rotate(e.clientX, e.clientY);
+    if (!(Date.now() - drag.rightAt < 300)) {
+      drag.rightAt = Date.now();
+      rotate(e.clientX, e.clientY);
+    }
   });
   document.addEventListener('keydown', (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
@@ -845,7 +867,7 @@ function renderPlacement() {
       <span class="blocks">${'<i></i>'.repeat(def.length)}</span>${def.name}${placed ? ' ✓' : ''}
     </button></li>`;
   }).join('');
-  $('#rotate').disabled = !editable;
+  $('#rotate').disabled = !editable || !placing.selected;
   $('#random').disabled = !editable;
   $('#clear').disabled = !editable || !state.myShips.length;
   $('#clear').textContent = clearArmed ? 'Zeker? Klik nog eens' : 'Wissen';
