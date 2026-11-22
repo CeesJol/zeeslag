@@ -8,7 +8,7 @@ const HEARTBEAT_MS = 3000;
 const TIMEOUT_MS = 12000;
 const DIAL_RETRY_MS = 4000;
 const DRAG_THRESHOLD_PX = 5;
-const DROP_MARGIN_PX = 30;
+const DROP_MARGIN_PX = 48;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -27,6 +27,8 @@ const placing = { selected: null, horizontal: true, hover: null, offset: 0 };
 let drag = null;
 let pointer = null;
 let swallowClick = false;
+let pressCell = null;
+let rightDropAt = 0;
 let clearArmed = false;
 let clearTimer = null;
 
@@ -554,22 +556,23 @@ function rotatePlaced(ship, [r, c]) {
 function startDrag(e, id, origin, offset) {
   if (e.button !== 0 || !canEditFleet()) return;
   if (drag) endDrag();
-  drag = { id, origin, offset, x: e.clientX, y: e.clientY, moved: false };
+  drag = { id, origin, offset, x: e.clientX, y: e.clientY, moved: false, pointerId: e.pointerId };
 }
 
 function moveDrag(e) {
   pointer = [e.clientX, e.clientY];
-  if (!drag) return;
+  if (!drag || e.pointerId !== drag.pointerId) return;
   // pointerup only comes when the last button is released, so a release of
   // the left button while the right one is still held is the drop.
-  if (drag.moved && e.buttons === 2) return endDrag();
-  // A right-button press during a drag shows up as a pointermove in Chrome;
-  // some browsers send contextmenu instead, so remember when it was handled.
-  const right = Boolean(e.buttons & 2);
-  if (right && !drag.right && drag.moved && !(Date.now() - drag.rightAt < 300)) {
-    drag.rightAt = Date.now();
-    rotate(e.clientX, e.clientY);
+  if (drag.moved && e.buttons === 2) {
+    rightDropAt = Date.now();
+    return endDrag();
   }
+  // A right-button press during a drag arrives as a pointermove with the
+  // extra button. contextmenu comes on press (macOS) or on release (Windows),
+  // so it is not used during a drag.
+  const right = Boolean(e.buttons & 2);
+  if (right && !drag.right && drag.moved) rotate(e.clientX, e.clientY);
   drag.right = right;
   if (!drag.moved) {
     if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD_PX) return;
@@ -608,12 +611,18 @@ function myCellAt(x, y, margin = 0) {
   return [index(y, first.top, pitchY, first.height), index(x, first.left, pitchX, first.width)];
 }
 
-function endDrag(cancel = false) {
+// `fromPress` is true when a new press ends a drag whose pointerup was lost;
+// the click of that press comes later and must be swallowed too.
+function endDrag(cancel = false, fromPress = false) {
   if (!drag) return;
   const { moved, origin } = drag;
   drag = null;
   if (!moved) return;
+  // The click after a drag comes in the same task as its pointerup. If it
+  // does not come at all (the pressed element was replaced), the flag must
+  // not swallow a later keyboard click.
   swallowClick = true;
+  if (!fromPress) setTimeout(() => { swallowClick = false; }, 0);
   document.body.classList.remove('dragging');
   $('#ghost').hidden = true;
   const overBoard = Boolean(placing.hover);
@@ -673,23 +682,34 @@ function buildBoard(el, side) {
     return cell && [Number(cell.dataset.r), Number(cell.dataset.c)];
   };
   el.addEventListener('click', (e) => {
-    const rc = side === 'my' ? myCellAt(e.clientX, e.clientY) : cellOf(e);
-    if (!rc) return;
-    if (side === 'opp') fire(...rc);
-    else if (canEditFleet()) clickCell(...rc);
+    if (side === 'opp') {
+      const rc = cellOf(e);
+      if (rc) fire(...rc);
+      return;
+    }
+    if (!canEditFleet()) return;
+    // A keyboard click (detail 0) has no position; use the focused cell.
+    // A mouse click counts only when press and release are on the same cell,
+    // so a press that slides to another cell does not place a ship there.
+    const rc = e.detail === 0 ? cellOf(e) : myCellAt(e.clientX, e.clientY);
+    if (!rc || (e.detail !== 0 && String(rc) !== String(pressCell))) return;
+    clickCell(...rc);
   });
   if (side !== 'my') return;
   el.addEventListener('pointerdown', (e) => {
     const rc = myCellAt(e.clientX, e.clientY);
+    pressCell = rc;
     const ship = rc && canEditFleet() && shipAtCell(...rc);
     if (!ship || e.button !== 0) return;
     e.preventDefault();
     const offset = ship.cells.findIndex(([r, c]) => r === rc[0] && c === rc[1]);
     startDrag(e, ship.id, ship, offset);
   });
-  el.addEventListener('mouseover', (e) => {
-    const rc = cellOf(e);
-    if (!rc || drag || !canEditFleet()) return;
+  // Same geometry as the click, so the preview is where a click places it.
+  el.addEventListener('pointermove', (e) => {
+    if (drag || !canEditFleet()) return;
+    const rc = myCellAt(e.clientX, e.clientY);
+    if (!rc || String(rc) === String(placing.hover)) return;
     placing.hover = rc;
     render();
   });
@@ -751,9 +771,9 @@ function bindControls() {
   // ship still hangs on the pointer and this press drops it.
   document.addEventListener('pointerdown', (e) => {
     swallowClick = false;
-    if (!drag?.moved) return;
+    if (!drag?.moved || e.pointerId !== drag.pointerId) return;
     trackDrag(e.clientX, e.clientY);
-    endDrag();
+    endDrag(false, true);
     e.preventDefault();
     e.stopImmediatePropagation();
   }, true);
@@ -766,7 +786,8 @@ function bindControls() {
   }, true);
   document.addEventListener('pointermove', moveDrag);
   document.addEventListener('pointerup', (e) => {
-    if (drag?.moved) trackDrag(e.clientX, e.clientY);
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    if (drag.moved) trackDrag(e.clientX, e.clientY);
     endDrag();
   });
   window.addEventListener('scroll', () => {
@@ -777,11 +798,10 @@ function bindControls() {
   document.addEventListener('contextmenu', (e) => {
     if (!canEditFleet() || !(drag || e.target.closest?.('#my-board'))) return;
     e.preventDefault();
-    if (!drag?.moved) return rotate(e.clientX, e.clientY);
-    if (!(Date.now() - drag.rightAt < 300)) {
-      drag.rightAt = Date.now();
-      rotate(e.clientX, e.clientY);
-    }
+    // On Windows the contextmenu of a right press made during a drag arrives
+    // after the drop; it must not turn the ship that was just dropped.
+    if (drag?.moved || Date.now() - rightDropAt < 1500) return;
+    rotate(e.clientX, e.clientY);
   });
   // Space would also scroll the page or press the focused button (on keyup),
   // so both events are blocked while ships are placed.
