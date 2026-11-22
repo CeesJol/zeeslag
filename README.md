@@ -1,6 +1,6 @@
 # Zeeslag
 
-Battleship for two players, each on their own laptop. Static site, no server: the two browsers connect peer-to-peer with [PeerJS](https://peerjs.com) (its free cloud server only does the handshake).
+Battleship for two players, each on their own laptop. Static site, no own server: the two browsers exchange messages through two public MQTT brokers (HiveMQ and EMQX) at the same time. The game numbers and acknowledges its messages, so a lost or doubled message does no harm.
 
 Rules: 10×10, ships 5, 4, 3, 3, 2, ships may not touch (also not diagonally), one shot per turn (a hit gives no extra shot), random starter, score kept over rounds.
 

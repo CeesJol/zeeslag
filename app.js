@@ -4,10 +4,10 @@ import {
 } from './game.js';
 import * as sfx from './sound.js';
 
-const PEER_PREFIX = 'zeeslag-nl-v1-';
+const BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt'];
+const TOPIC_PREFIX = 'zeeslag-nl-v1';
 const HEARTBEAT_MS = 3000;
 const TIMEOUT_MS = 12000;
-const DIAL_RETRY_MS = 4000;
 const DRAG_THRESHOLD_PX = 5;
 const DROP_MARGIN_PX = 48;
 const SHOT_FLIGHT_MS = 450;
@@ -15,13 +15,9 @@ const SHOT_FLIGHT_MS = 450;
 const $ = (sel) => document.querySelector(sel);
 
 let state = null;
-let peer = null;
-let conn = null;
-let linked = null;
-let pendingConn = null;
+let clients = [];
+let linked = false;
 let lastSeen = 0;
-let dialTimer = null;
-let hostRetries = 0;
 let netProblem = null;
 let blocked = false;
 let wasLinked = false;
@@ -131,7 +127,7 @@ function startGame() {
   $('#sound').hidden = false;
   $('#net').hidden = false;
   $('#invite-link').value = inviteLink();
-  if (state.role === 'host') openHost(); else openGuest();
+  openTransport();
   setInterval(heartbeat, HEARTBEAT_MS);
   render();
 }
@@ -145,162 +141,104 @@ function newGame() {
   });
 }
 
-// The host owns the peer id in the link and the guest dials it. Ships stay in
-// the owner's browser until the round ends, so nobody can peek.
-function openHost() {
-  if (blocked) return;
-  const p = new Peer(PEER_PREFIX + state.gameId, { debug: 0 });
-  peer = p;
-  p.on('open', () => { hostRetries = 0; netProblem = null; render(); });
-  p.on('connection', attach);
-  watchSignaling(p, () => {
-    hostRetries++;
-    netProblem = hostRetries > 4 ? 'Dit spel is al open in een andere browser.' : null;
-    setTimeout(openHost, 2500);
-  }, openHost);
-}
+// Both browsers talk through two public MQTT brokers at the same time. A
+// relay works on every network, where a direct connection between two homes
+// often fails, and one broker may be down without breaking the game. Each
+// message arrives twice; the numbered messages below are applied only once.
+// Ships stay in the owner's browser until the round ends, so nobody can peek.
+const topicFor = (role) => `${TOPIC_PREFIX}/${state.gameId}/${role}`;
+const otherRole = () => (state.role === 'host' ? 'guest' : 'host');
+const brokerUp = () => clients.some((c) => c.connected);
 
-function openGuest() {
-  if (blocked) return;
-  const p = new Peer({ debug: 0 });
-  peer = p;
-  p.on('open', () => { netProblem = null; dial(); });
-  p.on('error', (err) => {
-    if (err.type !== 'peer-unavailable') return;
-    pendingConn?.close();
-    pendingConn = null;
-    scheduleDial(DIAL_RETRY_MS);
-  });
-  watchSignaling(p, null, openGuest);
-}
-
-// The signaling server is only needed to set up a connection. Losing it must
-// not end an open game connection, so a known peer reconnects instead of
-// being destroyed.
-function watchSignaling(p, onIdTaken, reopen) {
-  const retry = () => setTimeout(() => {
-    if (p !== peer || blocked) return;
-    if (p.destroyed) reopen();
-    else if (p.disconnected) p.reconnect();
-  }, 3000);
-  p.on('disconnected', retry);
-  p.on('error', (err) => {
-    if (err.type === 'unavailable-id' && onIdTaken) {
-      p.destroy();
-      onIdTaken();
-    } else if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) {
-      netProblem = 'Geen verbinding met de server. Opnieuw proberen…';
-      if (p.destroyed) retry();
-    }
-    render();
+function openTransport() {
+  if (!window.mqtt) {
+    netProblem = 'De verbindingsbibliotheek kon niet laden. Laad de pagina opnieuw.';
+    return;
+  }
+  clients = BROKERS.map((url) => {
+    const client = window.mqtt.connect(url, {
+      clientId: `zeeslag-${randomId()}${randomId()}`,
+      clean: true,
+      keepalive: 20,
+      connectTimeout: 8000,
+      reconnectPeriod: 3000,
+    });
+    client.on('connect', () => {
+      client.subscribe(topicFor(state.role), { qos: 0 }, () => sendHello());
+      render();
+    });
+    client.on('message', (topic, payload) => {
+      let msg;
+      try { msg = JSON.parse(payload.toString()); } catch { return; }
+      receive(msg);
+    });
+    client.on('close', render);
+    return client;
   });
 }
 
-function scheduleDial(ms) {
-  clearTimeout(dialTimer);
-  dialTimer = setTimeout(dial, ms);
-}
-
-function dial() {
-  if (blocked || conn || !peer || peer.destroyed || !peer.open) return;
-  pendingConn?.close();
-  pendingConn = peer.connect(PEER_PREFIX + state.gameId, { reliable: true, serialization: 'json' });
-  attach(pendingConn);
-  scheduleDial(DIAL_RETRY_MS * 2);
-}
-
-function attach(c) {
-  c.on('open', () => {
-    if (blocked || (state.role === 'guest' && c !== pendingConn)) { c.close(); return; }
-    pendingConn = null;
-    if (conn && conn !== c) {
-      const old = conn;
-      conn = null;
-      linked = null;
-      old.close();
-    }
-    conn = c;
-    clearTimeout(dialTimer);
-    lastSeen = Date.now();
-    sendHello();
-    render();
-  });
-  c.on('data', (msg) => {
-    if (c !== conn) return;
-    lastSeen = Date.now();
-    receive(msg);
-  });
-  c.on('close', () => dropConn(c));
-  c.on('error', () => dropConn(c));
-}
-
-function dropConn(c) {
-  if (c !== conn) return;
-  conn = null;
-  linked = null;
-  try { c.close(); } catch { /* already closed */ }
-  if (state.role === 'guest') scheduleDial(1000);
-  render();
+function send(msg) {
+  const data = JSON.stringify(msg);
+  for (const client of clients) {
+    if (client.connected) client.publish(topicFor(otherRole()), data, { qos: 0 });
+  }
 }
 
 function heartbeat() {
-  if (!conn) return;
-  if (Date.now() - lastSeen > TIMEOUT_MS) return dropConn(conn);
+  if (blocked || !brokerUp()) return render();
+  if (linked && Date.now() - lastSeen > TIMEOUT_MS) {
+    linked = false;
+    render();
+  }
   if (!linked) return sendHello();
   transmit({ type: 'ping', ack: state.net.inSeq });
   flushOutbox();
 }
 
-const isConnected = () => Boolean(linked?.open);
+const isConnected = () => linked && brokerUp();
 
 // Each saved game has a session id. Once the two sides have exchanged a game
 // message, a hello with another session id means a second browser or a lost
-// save; mixing the two would corrupt both games, so that link is refused.
+// save; mixing the two would corrupt both games, so that browser is refused.
 // Before that, a new session may replace the old one (for example, the host
 // tried the invite link in its own browser first).
 function sendHello() {
-  if (conn?.open) conn.send({ type: 'hello', session: state.sessionId, linked: linked === conn });
+  if (!blocked) send({ type: 'hello', session: state.sessionId, linked });
 }
 
 function onHello(msg) {
-  if (typeof msg.session !== 'string') return;
-  if (linked !== conn) {
+  if (typeof msg.session !== 'string' || msg.session === state.sessionId) return;
+  if (!linked || msg.session !== state.oppSession) {
     const untouched = state.net.inSeq === 0 && state.net.outbox.length === state.net.outSeq;
     if (!state.oppSession || untouched) state.oppSession = msg.session;
-    if (msg.session !== state.oppSession) return refuse(conn);
-    linked = conn;
+    if (msg.session !== state.oppSession) return send({ type: 'busy', to: msg.session });
+    if (!linked) {
+      toast(wasLinked ? 'Weer verbonden met je tegenstander.' : 'Je tegenstander is verbonden!', 'good');
+      wasLinked = true;
+    }
+    linked = true;
     netProblem = null;
-    toast(wasLinked ? 'Weer verbonden met je tegenstander.' : 'Je tegenstander is verbonden!', 'good');
-    wasLinked = true;
+    lastSeen = Date.now();
     save();
     transmit({ type: 'ping', ack: state.net.inSeq });
     flushOutbox();
   }
+  lastSeen = Date.now();
   if (!msg.linked) sendHello();
   render();
 }
 
-function refuse(c) {
-  c.send({ type: 'busy' });
-  conn = null;
-  linked = null;
-  setTimeout(() => c.close(), 1000);
-  if (state.role === 'guest') scheduleDial(DIAL_RETRY_MS);
-  render();
-}
-
-function onBusy() {
+function onBusy(msg) {
+  if (msg.to !== state.sessionId) return;
   blocked = true;
-  clearTimeout(dialTimer);
-  conn = null;
-  linked = null;
-  try { peer?.destroy(); } catch { /* already gone */ }
+  linked = false;
+  for (const client of clients) client.end(true);
   netProblem = 'Geen verbinding';
   render();
 }
 
 function transmit(msg) {
-  if (linked?.open) linked.send({ ...msg, from: state.sessionId, to: state.oppSession });
+  if (linked) send({ ...msg, from: state.sessionId, to: state.oppSession });
 }
 
 // Game messages are numbered and kept until the other side acknowledges them,
@@ -319,8 +257,9 @@ function flushOutbox() {
 function receive(msg) {
   if (!msg || typeof msg !== 'object') return;
   if (msg.type === 'hello') return onHello(msg);
-  if (msg.type === 'busy') return onBusy();
+  if (msg.type === 'busy') return onBusy(msg);
   if (!linked || msg.from !== state.oppSession || msg.to !== state.sessionId) return;
+  lastSeen = Date.now();
   if (typeof msg.ack === 'number') {
     state.net.outbox = state.net.outbox.filter((m) => m.seq > msg.ack);
   }
@@ -859,7 +798,8 @@ function render() {
   $('#net').className = connected ? 'ok' : blocked ? 'blocked' : 'wait';
   $('#love').disabled = !connected || loveCooling;
   renderSound();
-  $('#net-text').textContent = connected ? 'Verbonden' : netProblem ?? 'Wachten op je tegenstander…';
+  $('#net-text').textContent = connected ? 'Verbonden'
+    : netProblem ?? (brokerUp() ? 'Wachten op je tegenstander…' : 'Verbinden met de server…');
 
   $('#invite').hidden = !(state.role === 'host' && !connected && !blocked);
   $('#boards').hidden = blocked;
