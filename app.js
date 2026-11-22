@@ -2,6 +2,7 @@ import {
   SIZE, LETTERS, FLEET, key, coordName, shipName, shipCells, canPlace, randomFleet,
   isFleetComplete, isValidFleet, resolveShot,
 } from './game.js';
+import * as sfx from './sound.js';
 
 const PEER_PREFIX = 'zeeslag-nl-v1-';
 const HEARTBEAT_MS = 3000;
@@ -9,6 +10,7 @@ const TIMEOUT_MS = 12000;
 const DIAL_RETRY_MS = 4000;
 const DRAG_THRESHOLD_PX = 5;
 const DROP_MARGIN_PX = 48;
+const SHOT_FLIGHT_MS = 450;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -29,6 +31,7 @@ let pointer = null;
 let swallowClick = false;
 let pressCell = null;
 let rightDropAt = 0;
+let firedAt = 0;
 let clearArmed = false;
 let clearTimer = null;
 
@@ -125,6 +128,7 @@ function startGame() {
   $('#game').hidden = false;
   $('#score').hidden = false;
   $('#love').hidden = false;
+  $('#sound').hidden = false;
   $('#net').hidden = false;
   $('#invite-link').value = inviteLink();
   if (state.role === 'host') openHost(); else openGuest();
@@ -346,6 +350,7 @@ function onMessage(msg) {
     case 'love':
       toast('♥ Ik hou van jou', 'love');
       floatHearts(9);
+      sfx.love();
       break;
     case 'rematch':
       if (msg.round !== state.round || state.phase !== 'over') return;
@@ -387,6 +392,8 @@ function onShot(msg) {
 
   state.incoming[k] = res.result === 'miss' ? 'miss' : 'hit';
   state.lastIncoming = k;
+  sfx.fire();
+  playResult(res.result, res.allSunk ? 'lose' : null, SHOT_FLIGHT_MS);
   const where = coordName(r, c);
   if (res.result === 'miss') toast(`Je tegenstander schoot op ${where}: mis.`);
   else if (res.result === 'hit') toast(`Je tegenstander schoot op ${where}: raak!`, 'bad');
@@ -403,6 +410,7 @@ function onResult(msg) {
   state.pendingShot = null;
   state.outgoing[k] = msg.result === 'miss' ? 'miss' : 'hit';
   state.lastOutgoing = k;
+  playResult(msg.result, msg.allSunk ? 'win' : null, firedAt + SHOT_FLIGHT_MS - performance.now());
   if (msg.result === 'miss') toast(`${coordName(shot.r, shot.c)}: mis.`);
   else if (msg.result === 'hit') toast(`${coordName(shot.r, shot.c)}: raak!`, 'good');
   else {
@@ -411,6 +419,16 @@ function onResult(msg) {
   }
   if (msg.allSunk) endRound('me');
   else state.myTurn = false;
+}
+
+// The result sound waits until the shot has had time to "fly", also when the
+// answer from the other laptop comes back faster than that.
+function playResult(result, ending, delay) {
+  const sound = { miss: sfx.miss, hit: sfx.hit, sunk: sfx.sunk }[result];
+  setTimeout(() => {
+    sound?.();
+    if (ending) setTimeout(sfx[ending], result === 'sunk' ? 1500 : 800);
+  }, Math.max(0, delay));
 }
 
 function endRound(winner) {
@@ -436,6 +454,8 @@ function fire(r, c) {
   if (!canFire() || key(r, c) in state.outgoing) return;
   state.pendingShot = { r, c };
   post({ type: 'shot', round: state.round, r, c });
+  sfx.fire();
+  firedAt = performance.now();
   save();
   render();
 }
@@ -741,6 +761,17 @@ function bindControls() {
   $('#ready').addEventListener('click', markReady);
   $('#rematch').addEventListener('click', requestRematch);
   $('#love').addEventListener('click', sendLove);
+  $('#mute').addEventListener('click', () => {
+    sfx.setMuted(!sfx.isMuted());
+    renderSound();
+    sfx.tick();
+  });
+  $('#volume').addEventListener('input', (e) => {
+    sfx.setVolume(Number(e.target.value) / 100);
+    renderSound();
+  });
+  $('#volume').addEventListener('change', () => sfx.tick());
+  for (const type of ['pointerdown', 'keydown']) document.addEventListener(type, sfx.unlock, true);
   $('#copy').addEventListener('click', async () => {
     const input = $('#invite-link');
     try {
@@ -827,6 +858,7 @@ function render() {
   $('#score').innerHTML = `Jij <b>${state.score.me}</b> – <b>${state.score.opp}</b> Tegenstander`;
   $('#net').className = connected ? 'ok' : blocked ? 'blocked' : 'wait';
   $('#love').disabled = !connected || loveCooling;
+  renderSound();
   $('#net-text').textContent = connected ? 'Verbonden' : netProblem ?? 'Wachten op je tegenstander…';
 
   $('#invite').hidden = !(state.role === 'host' && !connected && !blocked);
@@ -953,6 +985,14 @@ function renderPlacement() {
   $('#opp-ready').textContent = isConnected()
     ? (state.oppReady ? 'Je tegenstander is klaar.' : 'Je tegenstander plaatst nog schepen.')
     : '';
+}
+
+function renderSound() {
+  const silent = sfx.isMuted() || sfx.getVolume() === 0;
+  $('#mute').textContent = silent ? '🔇' : '🔊';
+  $('#mute').setAttribute('aria-label', silent ? 'Geluid aan' : 'Geluid uit');
+  $('#mute').title = silent ? 'Geluid aan' : 'Geluid uit';
+  $('#volume').value = String(Math.round(sfx.getVolume() * 100));
 }
 
 let toastTimer = null;

@@ -288,6 +288,11 @@ kbd { background: var(--bg); border: 1px solid #ffffff33; border-radius: 4px; pa
 #love:hover:not(:disabled) { opacity: 1; background: transparent; }
 #love:disabled { opacity: 0.2; }
 #toast.love { border-color: #f29bbf; }
+#sound { display: flex; align-items: center; gap: 4px; opacity: 0.6; }
+#sound:hover, #sound:focus-within { opacity: 1; }
+#mute { padding: 2px 4px; font-size: 16px; background: transparent; border: 0; }
+#mute:hover:not(:disabled) { background: transparent; }
+#volume { width: 84px; accent-color: var(--gold); cursor: pointer; }
 .heart {
   position: fixed;
   bottom: -30px;
