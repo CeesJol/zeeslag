@@ -7,18 +7,26 @@ const PEER_PREFIX = 'zeeslag-nl-v1-';
 const HEARTBEAT_MS = 3000;
 const TIMEOUT_MS = 12000;
 const DIAL_RETRY_MS = 4000;
+const DRAG_THRESHOLD_PX = 5;
 
 const $ = (sel) => document.querySelector(sel);
 
 let state = null;
 let peer = null;
 let conn = null;
+let linked = null;
+let pendingConn = null;
 let lastSeen = 0;
 let dialTimer = null;
-let pendingConn = null;
 let hostRetries = 0;
 let netProblem = null;
-const placing = { selected: FLEET[0].id, horizontal: true, hover: null };
+let blocked = false;
+let wasLinked = false;
+const placing = { selected: null, horizontal: true, hover: null, offset: 0 };
+let drag = null;
+let suppressClick = false;
+let clearArmed = false;
+let clearTimer = null;
 
 function freshRound() {
   return {
@@ -42,9 +50,7 @@ function freshRound() {
 }
 
 function newState(gameId, role) {
-  return {
-    gameId, role, round: 1, score: { me: 0, opp: 0 }, net: { outSeq: 0, inSeq: 0, outbox: [] }, ...freshRound(),
-  };
+  return { gameId, role, round: 1, score: { me: 0, opp: 0 }, ...freshRound() };
 }
 
 const storageKey = () => `zeeslag:${state.gameId}:${state.role}`;
@@ -75,10 +81,24 @@ function init() {
   if (!gameId) return showHome();
   if (!/^[a-z0-9]{6,16}$/.test(gameId)) return showHome('Deze link klopt niet. Start een nieuw spel.');
   const role = flag === 'h' ? 'host' : 'guest';
-  state = load(gameId, role) ?? newState(gameId, role);
-  placing.selected = nextUnplaced();
-  save();
-  startGame();
+  lockGame(gameId, role, () => {
+    state = load(gameId, role) ?? newState(gameId, role);
+    startGame();
+  });
+}
+
+// Two tabs with the same game and role would fight over the connection and
+// overwrite each other's saved state, so only one tab may hold the game.
+function lockGame(gameId, role, begin) {
+  if (!navigator.locks) return begin();
+  navigator.locks.request(`zeeslag:${gameId}:${role}`, { ifAvailable: true }, (lock) => {
+    if (!lock) {
+      showHome('Dit spel is al open in een ander tabblad. Ga naar dat tabblad.');
+      return null;
+    }
+    begin();
+    return new Promise(() => {});
+  });
 }
 
 function showHome(error) {
@@ -90,6 +110,11 @@ function showHome(error) {
 }
 
 function startGame() {
+  state.net ??= { outSeq: 0, inSeq: 0, outbox: [] };
+  state.sessionId ??= randomId();
+  state.oppSession ??= null;
+  placing.selected = nextUnplaced();
+  save();
   $('#home').hidden = true;
   $('#game').hidden = false;
   $('#score').hidden = false;
@@ -101,27 +126,31 @@ function startGame() {
 }
 
 function newGame() {
-  state = newState(randomId(), 'host');
-  history.replaceState(null, '', `#${state.gameId}/h`);
-  save();
-  startGame();
+  const gameId = randomId();
+  lockGame(gameId, 'host', () => {
+    state = newState(gameId, 'host');
+    history.replaceState(null, '', `#${gameId}/h`);
+    startGame();
+  });
 }
 
 // The host owns the peer id in the link and the guest dials it. Ships stay in
 // the owner's browser until the round ends, so nobody can peek.
 function openHost() {
+  if (blocked) return;
   const p = new Peer(PEER_PREFIX + state.gameId, { debug: 0 });
   peer = p;
   p.on('open', () => { hostRetries = 0; netProblem = null; render(); });
   p.on('connection', attach);
   watchSignaling(p, () => {
     hostRetries++;
-    netProblem = hostRetries > 4 ? 'Dit spel is al open in een ander venster.' : null;
+    netProblem = hostRetries > 4 ? 'Dit spel is al open in een andere browser.' : null;
     setTimeout(openHost, 2500);
   }, openHost);
 }
 
 function openGuest() {
+  if (blocked) return;
   const p = new Peer({ debug: 0 });
   peer = p;
   p.on('open', () => { netProblem = null; dial(); });
@@ -139,7 +168,7 @@ function openGuest() {
 // being destroyed.
 function watchSignaling(p, onIdTaken, reopen) {
   const retry = () => setTimeout(() => {
-    if (p !== peer) return;
+    if (p !== peer || blocked) return;
     if (p.destroyed) reopen();
     else if (p.disconnected) p.reconnect();
   }, 3000);
@@ -162,7 +191,7 @@ function scheduleDial(ms) {
 }
 
 function dial() {
-  if (conn || !peer || peer.destroyed || !peer.open) return;
+  if (blocked || conn || !peer || peer.destroyed || !peer.open) return;
   pendingConn?.close();
   pendingConn = peer.connect(PEER_PREFIX + state.gameId, { reliable: true, serialization: 'json' });
   attach(pendingConn);
@@ -171,17 +200,18 @@ function dial() {
 
 function attach(c) {
   c.on('open', () => {
-    if (state.role === 'guest' && c !== pendingConn) { c.close(); return; }
+    if (blocked || (state.role === 'guest' && c !== pendingConn)) { c.close(); return; }
     pendingConn = null;
     if (conn && conn !== c) {
       const old = conn;
       conn = null;
+      linked = null;
       old.close();
     }
     conn = c;
     clearTimeout(dialTimer);
     lastSeen = Date.now();
-    flushOutbox();
+    sendHello();
     render();
   });
   c.on('data', (msg) => {
@@ -196,6 +226,7 @@ function attach(c) {
 function dropConn(c) {
   if (c !== conn) return;
   conn = null;
+  linked = null;
   try { c.close(); } catch { /* already closed */ }
   if (state.role === 'guest') scheduleDial(1000);
   render();
@@ -204,15 +235,59 @@ function dropConn(c) {
 function heartbeat() {
   if (!conn) return;
   if (Date.now() - lastSeen > TIMEOUT_MS) return dropConn(conn);
-  send({ type: 'ping', ack: state.net.inSeq });
+  if (!linked) return sendHello();
+  transmit({ type: 'ping', ack: state.net.inSeq });
   flushOutbox();
 }
 
-function send(msg) {
-  if (conn?.open) conn.send(msg);
+const isConnected = () => Boolean(linked?.open);
+
+// Each saved game has a session id. A hello with another session id than the
+// one this game was first played with means a second browser or a lost save;
+// mixing the two would corrupt both games, so that link is refused.
+function sendHello() {
+  if (conn?.open) conn.send({ type: 'hello', session: state.sessionId, linked: linked === conn });
 }
 
-const isConnected = () => Boolean(conn?.open);
+function onHello(msg) {
+  if (typeof msg.session !== 'string') return;
+  if (linked !== conn) {
+    state.oppSession ??= msg.session;
+    if (msg.session !== state.oppSession) return refuse(conn);
+    linked = conn;
+    netProblem = null;
+    toast(wasLinked ? 'Weer verbonden met je tegenstander.' : 'Je tegenstander is verbonden!', 'good');
+    wasLinked = true;
+    save();
+    transmit({ type: 'ping', ack: state.net.inSeq });
+    flushOutbox();
+  }
+  if (!msg.linked) sendHello();
+  render();
+}
+
+function refuse(c) {
+  c.send({ type: 'busy' });
+  conn = null;
+  linked = null;
+  setTimeout(() => c.close(), 1000);
+  if (state.role === 'guest') scheduleDial(DIAL_RETRY_MS);
+  render();
+}
+
+function onBusy() {
+  blocked = true;
+  clearTimeout(dialTimer);
+  conn = null;
+  linked = null;
+  try { peer?.destroy(); } catch { /* already gone */ }
+  netProblem = 'Geen verbinding';
+  render();
+}
+
+function transmit(msg) {
+  if (linked?.open) linked.send({ ...msg, from: state.sessionId, to: state.oppSession });
+}
 
 // Game messages are numbered and kept until the other side acknowledges them,
 // and both sides persist the counters. So each message is applied exactly
@@ -220,15 +295,18 @@ const isConnected = () => Boolean(conn?.open);
 function post(msg) {
   const m = { ...msg, seq: ++state.net.outSeq };
   state.net.outbox.push(m);
-  send(m);
+  transmit(m);
 }
 
 function flushOutbox() {
-  for (const m of state.net.outbox) send(m);
+  for (const m of state.net.outbox) transmit(m);
 }
 
 function receive(msg) {
   if (!msg || typeof msg !== 'object') return;
+  if (msg.type === 'hello') return onHello(msg);
+  if (msg.type === 'busy') return onBusy();
+  if (!linked || msg.from !== state.oppSession || msg.to !== state.sessionId) return;
   if (typeof msg.ack === 'number') {
     state.net.outbox = state.net.outbox.filter((m) => m.seq > msg.ack);
   }
@@ -237,7 +315,7 @@ function receive(msg) {
     state.net.inSeq = msg.seq;
     onMessage(msg);
   }
-  send({ type: 'ack', ack: state.net.inSeq });
+  transmit({ type: 'ack', ack: state.net.inSeq });
   save();
   render();
 }
@@ -314,7 +392,7 @@ function onResult(msg) {
   if (msg.result === 'miss') toast(`${coordName(shot.r, shot.c)}: mis.`);
   else if (msg.result === 'hit') toast(`${coordName(shot.r, shot.c)}: raak!`, 'good');
   else {
-    if (msg.ship) state.oppSunk.push(msg.ship);
+    if (Array.isArray(msg.ship?.cells)) state.oppSunk.push(msg.ship);
     toast(`Gezonken! Je liet de ${shipName(msg.ship?.id).toLowerCase()} zinken.`, 'good');
   }
   if (msg.allSunk) endRound('me');
@@ -337,8 +415,8 @@ function nextRound() {
   Object.assign(state, freshRound(), { round: state.round + 1 });
   placing.selected = FLEET[0].id;
   placing.hover = null;
+  placing.offset = 0;
 }
-
 
 function fire(r, c) {
   if (!canFire() || key(r, c) in state.outgoing) return;
@@ -368,35 +446,47 @@ function requestRematch() {
   render();
 }
 
-
 const canEditFleet = () => state?.phase === 'placing' && !state.myReady;
 const nextUnplaced = () => FLEET.find((d) => !state.myShips.some((s) => s.id === d.id))?.id ?? null;
+const shipAtCell = (r, c) => state.myShips.find((s) => s.cells.some(([sr, sc]) => sr === r && sc === c));
+const isHorizontal = (ship) => ship.cells.length < 2 || ship.cells[0][0] === ship.cells[1][0];
 
+// `offset` is the index of the ship cell under the pointer, so a ship that is
+// dragged by its middle stays under the pointer at the same spot.
 function previewCells() {
   if (!placing.selected || !placing.hover) return null;
   const def = FLEET.find((d) => d.id === placing.selected);
-  const cells = shipCells(placing.hover[0], placing.hover[1], def.length, placing.horizontal);
+  const [hr, hc] = placing.hover;
+  const r = placing.horizontal ? hr : hr - placing.offset;
+  const c = placing.horizontal ? hc - placing.offset : hc;
+  const cells = shipCells(r, c, def.length, placing.horizontal);
   return { cells, ok: canPlace(state.myShips, cells) };
 }
 
-function pickUp(id) {
-  const ship = state.myShips.find((s) => s.id === id);
-  if (!ship) return;
-  state.myShips = state.myShips.filter((s) => s.id !== id);
+function selectShip(id) {
   placing.selected = id;
-  if (ship.cells.length > 1) placing.horizontal = ship.cells[0][0] === ship.cells[1][0];
+  placing.offset = 0;
 }
 
-function placeAt(r, c) {
-  const owner = state.myShips.find((s) => s.cells.some(([sr, sc]) => sr === r && sc === c));
-  if (owner) {
-    pickUp(owner.id);
-  } else if (placing.selected && !state.myShips.some((s) => s.id === placing.selected)) {
-    const preview = previewCells();
-    if (!preview?.ok) return;
-    state.myShips.push({ id: placing.selected, cells: preview.cells });
-    placing.selected = nextUnplaced();
-  }
+function pickUp(ship, offset = 0) {
+  state.myShips = state.myShips.filter((s) => s !== ship);
+  placing.selected = ship.id;
+  placing.offset = offset;
+  placing.horizontal = isHorizontal(ship);
+}
+
+function dropSelected() {
+  const preview = previewCells();
+  if (!preview?.ok || state.myShips.some((s) => s.id === placing.selected)) return false;
+  state.myShips.push({ id: placing.selected, cells: preview.cells });
+  selectShip(nextUnplaced());
+  return true;
+}
+
+function clickCell(r, c) {
+  const owner = shipAtCell(r, c);
+  if (owner) pickUp(owner);
+  else if (placing.selected) dropSelected();
   save();
   render();
 }
@@ -404,9 +494,74 @@ function placeAt(r, c) {
 function rotate() {
   if (!canEditFleet()) return;
   placing.horizontal = !placing.horizontal;
+  placing.offset = 0;
+  updateGhost();
   render();
 }
 
+function startDrag(e, id, origin, offset) {
+  if (e.button !== 0 || !canEditFleet()) return;
+  drag = { id, origin, offset, x: e.clientX, y: e.clientY, moved: false };
+}
+
+function moveDrag(e) {
+  if (!drag) return;
+  if (!drag.moved) {
+    if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < DRAG_THRESHOLD_PX) return;
+    drag.moved = true;
+    if (drag.origin) pickUp(drag.origin, drag.offset);
+    else selectShip(drag.id);
+    document.body.classList.add('dragging');
+    updateGhost();
+  }
+  const cell = document.elementFromPoint(e.clientX, e.clientY)?.closest('#my-board .cell');
+  placing.hover = cell ? [Number(cell.dataset.r), Number(cell.dataset.c)] : null;
+  const ghost = $('#ghost');
+  ghost.hidden = Boolean(cell);
+  ghost.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
+  render();
+}
+
+function endDrag() {
+  if (!drag) return;
+  const { moved, origin } = drag;
+  drag = null;
+  if (!moved) return;
+  suppressClick = true;
+  setTimeout(() => { suppressClick = false; }, 0);
+  document.body.classList.remove('dragging');
+  $('#ghost').hidden = true;
+  if (!dropSelected() && origin) {
+    state.myShips.push(origin);
+    selectShip(nextUnplaced());
+  }
+  placing.hover = null;
+  save();
+  render();
+}
+
+function updateGhost() {
+  const def = FLEET.find((d) => d.id === placing.selected);
+  const ghost = $('#ghost');
+  if (!def) return;
+  ghost.innerHTML = '<i></i>'.repeat(def.length);
+  ghost.classList.toggle('vertical', !placing.horizontal);
+}
+
+function armClear() {
+  if (!canEditFleet() || !state.myShips.length) return;
+  clearTimeout(clearTimer);
+  if (!clearArmed) {
+    clearArmed = true;
+    clearTimer = setTimeout(() => { clearArmed = false; render(); }, 3000);
+  } else {
+    clearArmed = false;
+    state.myShips = [];
+    selectShip(FLEET[0].id);
+    save();
+  }
+  render();
+}
 
 function buildBoard(el, side) {
   el.innerHTML = '';
@@ -423,31 +578,36 @@ function buildBoard(el, side) {
       el.append(cell);
     }
   }
-  el.addEventListener('click', (e) => {
+  const cellOf = (e) => {
     const cell = e.target.closest('.cell');
-    if (!cell) return;
-    const r = Number(cell.dataset.r);
-    const c = Number(cell.dataset.c);
-    if (side === 'opp') fire(r, c);
-    else if (canEditFleet()) placeAt(r, c);
+    return cell && [Number(cell.dataset.r), Number(cell.dataset.c)];
+  };
+  el.addEventListener('click', (e) => {
+    const rc = cellOf(e);
+    if (!rc || suppressClick) return;
+    if (side === 'opp') fire(...rc);
+    else if (canEditFleet()) clickCell(...rc);
   });
-  if (side === 'my') {
-    el.addEventListener('mouseover', (e) => {
-      const cell = e.target.closest('.cell');
-      if (!cell || !state || !canEditFleet()) return;
-      placing.hover = [Number(cell.dataset.r), Number(cell.dataset.c)];
-      render();
-    });
-    el.addEventListener('mouseleave', () => {
-      placing.hover = null;
-      if (state) render();
-    });
-    el.addEventListener('contextmenu', (e) => {
-      if (!canEditFleet()) return;
-      e.preventDefault();
-      rotate();
-    });
-  }
+  if (side !== 'my') return;
+  el.addEventListener('pointerdown', (e) => {
+    const rc = cellOf(e);
+    const ship = rc && canEditFleet() && shipAtCell(...rc);
+    if (!ship) return;
+    e.preventDefault();
+    const offset = ship.cells.findIndex(([r, c]) => r === rc[0] && c === rc[1]);
+    startDrag(e, ship.id, ship, offset);
+  });
+  el.addEventListener('mouseover', (e) => {
+    const rc = cellOf(e);
+    if (!rc || drag || !canEditFleet()) return;
+    placing.hover = rc;
+    render();
+  });
+  el.addEventListener('mouseleave', () => {
+    if (!state || drag) return;
+    placing.hover = null;
+    render();
+  });
 }
 
 function label(text) {
@@ -463,17 +623,11 @@ function bindControls() {
   $('#random').addEventListener('click', () => {
     if (!canEditFleet()) return;
     state.myShips = randomFleet();
-    placing.selected = null;
+    selectShip(null);
     save();
     render();
   });
-  $('#clear').addEventListener('click', () => {
-    if (!canEditFleet()) return;
-    state.myShips = [];
-    placing.selected = FLEET[0].id;
-    save();
-    render();
-  });
+  $('#clear').addEventListener('click', armClear);
   $('#ready').addEventListener('click', markReady);
   $('#rematch').addEventListener('click', requestRematch);
   $('#copy').addEventListener('click', async () => {
@@ -487,17 +641,33 @@ function bindControls() {
     $('#copy').textContent = 'Gekopieerd!';
     setTimeout(() => { $('#copy').textContent = 'Kopieer'; }, 2000);
   });
-  $('#picker').addEventListener('click', (e) => {
+  $('#picker').addEventListener('pointerdown', (e) => {
     const item = e.target.closest('[data-ship]');
     if (!item || !canEditFleet()) return;
+    e.preventDefault();
     const id = item.dataset.ship;
-    if (state.myShips.some((s) => s.id === id)) pickUp(id);
-    else placing.selected = id;
+    startDrag(e, id, state.myShips.find((s) => s.id === id) ?? null, 0);
+  });
+  $('#picker').addEventListener('click', (e) => {
+    const item = e.target.closest('[data-ship]');
+    if (!item || !canEditFleet() || suppressClick) return;
+    const placed = state.myShips.find((s) => s.id === item.dataset.ship);
+    if (placed) pickUp(placed);
+    else selectShip(item.dataset.ship);
     save();
     render();
   });
+  document.addEventListener('pointermove', moveDrag);
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
+  document.addEventListener('contextmenu', (e) => {
+    if (!canEditFleet() || !(drag || e.target.closest('#my-board'))) return;
+    e.preventDefault();
+    rotate();
+  });
   document.addEventListener('keydown', (e) => {
-    if ((e.key === 'r' || e.key === 'R') && !e.target.closest('input')) rotate();
+    if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input')) return;
+    if (e.key === 'd' || e.key === 'D') rotate();
   });
 }
 
@@ -510,16 +680,13 @@ function render() {
   const { phase } = state;
 
   $('#score').innerHTML = `Jij <b>${state.score.me}</b> – <b>${state.score.opp}</b> Tegenstander`;
-  const net = $('#net');
-  net.className = connected ? 'ok' : 'wait';
-  $('#net-text').textContent = connected
-    ? 'Verbonden'
-    : netProblem ?? (state.role === 'host' ? 'Wachten op tegenstander…' : 'Verbinden met het spel…');
+  $('#net').className = connected ? 'ok' : blocked ? 'blocked' : 'wait';
+  $('#net-text').textContent = connected ? 'Verbonden' : netProblem ?? 'Wachten op je tegenstander…';
 
-  $('#invite').hidden = !(state.role === 'host' && !connected);
+  $('#invite').hidden = !(state.role === 'host' && !connected && !blocked);
   $('#placement').hidden = phase !== 'placing';
   $('#opp-wrap').hidden = phase === 'placing';
-  $('#over-actions').hidden = phase !== 'over';
+  $('#over-actions').hidden = phase !== 'over' || blocked;
 
   renderStatus(connected);
   renderMyBoard();
@@ -532,25 +699,31 @@ function render() {
       ? 'Wachten tot je tegenstander ook op "Nog een potje" klikt…'
       : state.rematchOpp ? 'Je tegenstander wil nog een potje!' : '';
   }
+  document.title = phase === 'playing' && state.myTurn && !state.pendingShot ? '🎯 Jouw beurt – Zeeslag' : 'Zeeslag';
 }
 
 function renderStatus(connected) {
   const s = $('#status');
   let text;
   let tone = '';
-  if (state.phase === 'placing') {
+  if (blocked) {
+    text = state.role === 'guest'
+      ? 'Dit spel wordt al gespeeld in een andere browser. Open de link in de browser waarin je eerder speelde.'
+      : 'Dit spel is al open in een andere browser. Gebruik die browser, of start een nieuw spel.';
+    tone = 'lose';
+  } else if (state.phase === 'placing') {
     if (!state.myReady) text = 'Plaats je schepen en klik op Klaar.';
     else if (!state.oppReady) text = 'Klaar! Wachten tot je tegenstander de schepen heeft geplaatst…';
     else text = 'Het spel begint…';
   } else if (state.phase === 'playing') {
-    if (state.pendingShot) text = `Schot op ${coordName(state.pendingShot.r, state.pendingShot.c)}…`;
+    if (!connected) text = 'Geen verbinding met je tegenstander. Even wachten…';
+    else if (state.pendingShot) text = `Schot op ${coordName(state.pendingShot.r, state.pendingShot.c)}…`;
     else if (state.myTurn) { text = 'Jij bent aan de beurt. Kies een vakje bij de tegenstander.'; tone = 'turn'; }
     else text = 'Je tegenstander is aan de beurt…';
   } else {
     text = state.winner === 'me' ? 'Gewonnen! Je hebt de hele vloot laten zinken.' : 'Verloren. Je hele vloot is gezonken.';
     tone = state.winner === 'me' ? 'win' : 'lose';
   }
-  if (!connected && state.phase === 'playing') text += ' (geen verbinding)';
   s.textContent = text;
   s.className = tone;
 }
@@ -619,7 +792,11 @@ function renderPlacement() {
       <span class="blocks">${'<i></i>'.repeat(def.length)}</span>${def.name}${placed ? ' ✓' : ''}
     </button></li>`;
   }).join('');
-  for (const id of ['#rotate', '#random', '#clear']) $(id).disabled = !editable;
+  $('#rotate').disabled = !editable;
+  $('#random').disabled = !editable;
+  $('#clear').disabled = !editable || !state.myShips.length;
+  $('#clear').textContent = clearArmed ? 'Zeker? Klik nog eens' : 'Wissen';
+  $('#clear').classList.toggle('danger', clearArmed);
   $('#rotate').textContent = placing.horizontal ? 'Draai (nu liggend)' : 'Draai (nu staand)';
   $('#ready').disabled = !editable || !isFleetComplete(state.myShips);
   $('#ready').textContent = state.myReady ? 'Klaar ✓' : 'Klaar';
